@@ -128,7 +128,7 @@ function RichToolbar({ editorRef }) {
   )
 }
 
-// ---------- Document Import (Text, PDF, Word, Scanned) with Table Detection ----------
+// ---------- Document Import (Text, PDF, Word, Scanned) with Table Detection + Smart Format ----------
 function ImportDocModal({ open, onClose, onExtracted }) {
   const [dragOver, setDragOver] = useState(false)
   const [status, setStatus] = useState('')
@@ -139,28 +139,20 @@ function ImportDocModal({ open, onClose, onExtracted }) {
   const fileRef = useRef(null)
 
   const detectTablesInText = (text) => {
-    // Detect markdown tables, tab-separated, or multi-space aligned tables
     const lines = text.split('\n')
     let tableLines = []
     let inTable = false
     let tables = []
-
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]
-      // Markdown table row: | col | col |
       const isMarkdownTable = /^\s*\|.*\|.*\|/.test(line) || /^\s*\|?\s*[-:]+\s*\|/.test(line)
-      // Tab separated with at least 2 tabs
       const isTabTable = (line.match(/\t/g) || []).length >= 2
-      // Multi-space aligned (at least 3 columns separated by 2+ spaces)
       const isSpaceTable = line.split(/\s{2,}/).filter(c => c.trim()).length >= 3
-
       if (isMarkdownTable || isTabTable || isSpaceTable) {
         if (!inTable) inTable = true
         tableLines.push(line)
       } else {
-        if (inTable && tableLines.length >= 2) {
-          tables.push([...tableLines])
-        }
+        if (inTable && tableLines.length >= 2) tables.push([...tableLines])
         tableLines = []
         inTable = false
       }
@@ -169,16 +161,39 @@ function ImportDocModal({ open, onClose, onExtracted }) {
     return tables.length > 0
   }
 
-  const textToHtmlWithTables = (text) => {
+  const smartImproveText = (raw) => {
+    let text = raw.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').replace(/ +\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+    const hasParagraphs = text.includes('\n\n')
+    if (!hasParagraphs && text.length > 300) {
+      const sentences = text.match(/[^.!?]+[.!?]+(\s|$)/g) || [text]
+      let paras = []
+      let current = []
+      for (const s of sentences) {
+        current.push(s.trim())
+        if (current.length >= 3 || current.join(' ').length > 250) {
+          paras.push(current.join(' '))
+          current = []
+        }
+      }
+      if (current.length) paras.push(current.join(' '))
+      text = paras.join('\n\n')
+    }
+    return text
+  }
+
+  const textToHtmlWithTables = (rawText) => {
+    const text = smartImproveText(rawText)
     const lines = text.split('\n')
-    let html = ''
+    let result = []
+    let currentPara = []
     let inTable = false
     let tableBuffer = []
-    let tableHeaders = []
+    let inList = false
+    let listBuffer = []
+    let listType = 'ul'
 
     const flushTable = () => {
       if (tableBuffer.length === 0) return ''
-      // Detect if first row is header
       let out = '<table class="letter-table"><thead><tr>'
       const headerCells = tableBuffer[0].split(/\t|\s{2,}|\|/).map(c => c.trim()).filter(Boolean)
       headerCells.forEach(h => {
@@ -187,12 +202,12 @@ function ImportDocModal({ open, onClose, onExtracted }) {
       out += '</tr></thead><tbody>'
       for (let i = 1; i < tableBuffer.length; i++) {
         const line = tableBuffer[i]
-        if (/^\s*\|?\s*[-:]+\s*\|/.test(line)) continue // skip markdown separator
+        if (/^\s*\|?\s*[-:]+\s*\|/.test(line)) continue
         const cells = line.split(/\t|\s{2,}|\|/).map(c => c.trim()).filter(Boolean)
         if (cells.length === 0) continue
         out += '<tr>'
         cells.forEach(cell => {
-          const isNum = /^-?[\d,]+(\.\d+)?$/.test(cell.replace(/[$%]/g,'').trim())
+          const isNum = /^-?[\d,]+(\.\d+)?$/.test(cell.replace(/[$%₦,]/g,'').trim())
           out += `<td class="${isNum ? 'num' : ''}">${cell}</td>`
         })
         out += '</tr>'
@@ -202,76 +217,90 @@ function ImportDocModal({ open, onClose, onExtracted }) {
       return out
     }
 
-    let result = []
-    let currentPara = []
+    const flushList = () => {
+      if (listBuffer.length === 0) return ''
+      const tag = listType
+      let out = `<${tag} style="margin:12px 0 12px 20px; line-height:1.7">`
+      listBuffer.forEach(item => { out += `<li>${item}</li>` })
+      out += `</${tag}>`
+      listBuffer = []
+      inList = false
+      return out
+    }
+
+    const flushPara = () => {
+      if (currentPara.length) {
+        const paraText = currentPara.join(' ').trim()
+        if (paraText) {
+          if (paraText.length < 80 && (paraText.endsWith(':') || (paraText.toUpperCase() === paraText && paraText.length > 3 && paraText.length < 70))) {
+            result.push(`<p><strong>${paraText}</strong></p>`)
+          } else {
+            result.push(`<p>${paraText}</p>`)
+          }
+        }
+        currentPara = []
+      }
+    }
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]
       const trimmed = line.trim()
       if (!trimmed) {
-        if (currentPara.length) {
-          result.push(`<p>${currentPara.join(' ')}</p>`)
-          currentPara = []
-        }
-        if (inTable) {
-          result.push(flushTable())
-          inTable = false
-        }
+        flushPara()
+        if (inTable) { result.push(flushTable()); inTable = false }
+        if (inList) { result.push(flushList()) }
         continue
       }
-
       const isTableRow = (line.match(/\t/g) || []).length >= 2 || line.split(/\s{2,}/).filter(c => c.trim()).length >= 3 || /^\s*\|.*\|/.test(line)
-
       if (isTableRow) {
-        if (currentPara.length) {
-          result.push(`<p>${currentPara.join(' ')}</p>`)
-          currentPara = []
-        }
+        flushPara()
+        if (inList) result.push(flushList())
         inTable = true
         tableBuffer.push(line)
-      } else {
-        if (inTable) {
-          // Check if table ended
-          if (tableBuffer.length >= 2) {
-            result.push(flushTable())
+        continue
+      }
+      const bulletMatch = trimmed.match(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+|\s*[a-zA-Z][\.\)]\s+)/)
+      if (bulletMatch) {
+        flushPara()
+        if (inTable) { result.push(flushTable()); inTable = false }
+        const content = trimmed.replace(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+|\s*[a-zA-Z][\.\)]\s+)/, '').trim()
+        if (/^\s*\d+[\.\)]/.test(trimmed)) listType = 'ol'
+        else listType = 'ul'
+        if (!inList) inList = true
+        listBuffer.push(content)
+        continue
+      }
+      if (inTable) {
+        if (tableBuffer.length >= 2) result.push(flushTable())
+        else currentPara.push(...tableBuffer)
+        inTable = false
+      }
+      if (inList) {
+        if (listBuffer.length && trimmed.length > 0) {
+          if (listBuffer[listBuffer.length - 1].length < 100) {
+            listBuffer[listBuffer.length - 1] += ' ' + trimmed
+            continue
           } else {
-            currentPara.push(...tableBuffer)
+            result.push(flushList())
           }
-          inTable = false
-        }
-        // Heading detection
-        if (trimmed.length < 80 && (trimmed.endsWith(':') || (trimmed.toUpperCase() === trimmed && trimmed.length > 3 && trimmed.length < 60))) {
-          if (currentPara.length) {
-            result.push(`<p>${currentPara.join(' ')}</p>`)
-            currentPara = []
-          }
-          result.push(`<p><strong>${trimmed}</strong></p>`)
-        } else {
-          currentPara.push(trimmed)
-          if (trimmed.endsWith('.') && currentPara.join(' ').length > 150) {
-            result.push(`<p>${currentPara.join(' ')}</p>`)
-            currentPara = []
-          }
+        } else if (inList) {
+          result.push(flushList())
         }
       }
+      currentPara.push(trimmed)
+      if (trimmed.endsWith('.') && currentPara.join(' ').length > 280) flushPara()
     }
     if (inTable && tableBuffer.length) result.push(flushTable())
-    if (currentPara.length) result.push(`<p>${currentPara.join(' ')}</p>`)
-
+    if (inList && listBuffer.length) result.push(flushList())
+    flushPara()
     return result.join('\n')
   }
 
   const formatToHtml = (text, htmlWithTables = null) => {
-    // If we have HTML with tables from mammoth, use it directly (cleaned)
     if (htmlWithTables && htmlWithTables.includes('<table')) {
-      // Clean mammoth HTML: add our class
-      let cleaned = htmlWithTables
-        .replace(/<table>/g, '<table class="letter-table">')
-        .replace(/<table[^>]*>/g, '<table class="letter-table">')
-      // Wrap loose text in <p> if needed
+      let cleaned = htmlWithTables.replace(/<table>/g, '<table class="letter-table">').replace(/<table[^>]*>/g, '<table class="letter-table">')
       return cleaned
     }
-    // Otherwise use smart text-to-HTML with table detection
     return textToHtmlWithTables(text)
   }
 
@@ -280,7 +309,6 @@ function ImportDocModal({ open, onClose, onExtracted }) {
     setProgress(10)
     const ext = file.name.split('.').pop().toLowerCase()
     const type = file.type
-
     try {
       if (type === 'text/plain' || ext === 'txt') {
         const txt = await file.text()
@@ -310,65 +338,40 @@ function ImportDocModal({ open, onClose, onExtracted }) {
             pdf = await pdfjsLib.getDocument({ data: buf, disableWorker: true }).promise
           } else throw err
         }
-
         let fullText = ''
         let hasTable = false
-
         for (let i = 1; i <= pdf.numPages; i++) {
           setProgress(Math.round((i / pdf.numPages) * 70))
           setStatus(`Reading PDF page ${i}/${pdf.numPages} — detecting tables...`)
           const page = await pdf.getPage(i)
           const content = await page.getTextContent()
-
-          // Advanced: group items by Y to detect table rows
           const items = content.items.map(item => ({
             str: item.str,
             x: item.transform[4],
             y: item.transform[5],
             width: item.width
           })).filter(it => it.str.trim())
-
-          // Sort by Y descending, then X
           items.sort((a, b) => b.y - a.y || a.x - b.x)
-
-          // Detect tables: look for rows with similar Y and multiple X clusters
           let rows = []
           let currentRow = []
           let lastY = null
           const yThreshold = 5
-
           for (const item of items) {
-            if (lastY === null || Math.abs(item.y - lastY) < yThreshold) {
-              currentRow.push(item)
-            } else {
-              if (currentRow.length) rows.push(currentRow)
-              currentRow = [item]
-            }
+            if (lastY === null || Math.abs(item.y - lastY) < yThreshold) currentRow.push(item)
+            else { if (currentRow.length) rows.push(currentRow); currentRow = [item] }
             lastY = item.y
           }
           if (currentRow.length) rows.push(currentRow)
-
-          // Check for table-like rows (multiple items with gaps)
           let pageText = ''
           for (const row of rows) {
             row.sort((a, b) => a.x - b.x)
-            // If row has 3+ items with significant gaps, treat as table row with tabs
             if (row.length >= 3) {
               const gaps = []
-              for (let j = 1; j < row.length; j++) {
-                gaps.push(row[j].x - (row[j-1].x + row[j-1].width))
-              }
+              for (let j = 1; j < row.length; j++) gaps.push(row[j].x - (row[j-1].x + row[j-1].width))
               const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length
-              if (avgGap > 20) {
-                hasTable = true
-                // Join with tabs to preserve table structure
-                pageText += row.map(r => r.str).join('\t') + '\n'
-              } else {
-                pageText += row.map(r => r.str).join(' ') + '\n'
-              }
-            } else {
-              pageText += row.map(r => r.str).join(' ') + '\n'
-            }
+              if (avgGap > 20) { hasTable = true; pageText += row.map(r => r.str).join('\t') + '\n' }
+              else pageText += row.map(r => r.str).join(' ') + '\n'
+            } else pageText += row.map(r => r.str).join(' ') + '\n'
           }
           fullText += pageText + '\n'
         }
@@ -381,7 +384,6 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         setStatus('Extracting Word doc with tables (mammoth)...')
         const mammoth = await import('mammoth')
         const buf = await file.arrayBuffer()
-        // Try HTML first to preserve tables
         const htmlResult = await mammoth.convertToHtml({ arrayBuffer: buf })
         const textResult = await mammoth.extractRawText({ arrayBuffer: buf })
         const hasTable = htmlResult.value.includes('<table')
@@ -400,9 +402,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           setHasTables(htmlResult.value.includes('<table'))
           setExtractedHtml(htmlResult.value)
           return result.value
-        } catch {
-          return await file.text().catch(() => 'Could not extract .doc - please save as .docx')
-        }
+        } catch { return await file.text().catch(() => 'Could not extract .doc - please save as .docx') }
       }
       if (type.startsWith('image/') || ['png','jpg','jpeg','webp','bmp'].includes(ext)) {
         setStatus('OCR on scanned doc — detecting tables... (10-20s)')
@@ -434,24 +434,15 @@ function ImportDocModal({ open, onClose, onExtracted }) {
   const handleFiles = async (files) => {
     if (!files || !files.length) return
     const file = files[0]
-    if (file.size > 20 * 1024 * 1024) {
-      setStatus('File too large — max 20MB')
-      return
-    }
+    if (file.size > 20 * 1024 * 1024) { setStatus('File too large — max 20MB'); return }
     try {
       const text = await extractText(file)
       setExtracted(text)
       setStatus(`Extracted ${text.length} chars${hasTables ? ' — tables detected!' : ''} from ${file.name}`)
-    } catch (err) {
-      setStatus('Failed: ' + err.message)
-    }
+    } catch (err) { setStatus('Failed: ' + err.message) }
   }
 
-  const handleDrop = (e) => {
-    e.preventDefault()
-    setDragOver(false)
-    handleFiles(e.dataTransfer.files)
-  }
+  const handleDrop = (e) => { e.preventDefault(); setDragOver(false); handleFiles(e.dataTransfer.files) }
 
   if (!open) return null
 
@@ -461,7 +452,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div>
             <h3 style={{ fontSize: 19 }}>Import Document to Letterhead</h3>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>Auto-detects tables, text, and formats professionally</div>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>Auto-detects tables, bullets, paragraphs — fine-tunes messy text</div>
           </div>
           <button className="btn-ghost" onClick={onClose} style={{ padding: '6px 12px' }}>✕ Close</button>
         </div>
@@ -481,11 +472,11 @@ function ImportDocModal({ open, onClose, onExtracted }) {
             transition: 'all 0.2s'
           }}
         >
-          <div style={{ fontSize: 36, marginBottom: 8 }}>📄📊</div>
-          <div style={{ fontWeight: 800, fontSize: 15 }}>Drop document with tables here</div>
+          <div style={{ fontSize: 36, marginBottom: 8 }}>📄📊✨</div>
+          <div style={{ fontWeight: 800, fontSize: 15 }}>Drop messy document here — auto-improves</div>
           <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 6, lineHeight: 1.4 }}>
-            <strong>Text, PDF, Word, Scanned Images</strong><br/>
-            Auto-detects tables • Preserves structure • Professional gold/black styling<br/>
+            <strong>Text, PDF, Word, Scanned</strong><br/>
+            Auto-detects tables • Adds paragraphs • Converts bullets • Professional styling<br/>
             .txt, .pdf, .docx, .doc, .png, .jpg — max 20MB
           </div>
           <div style={{ marginTop: 14 }}>
@@ -513,10 +504,10 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           <div style={{ marginTop: 18 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)' }}>
-                EXTRACTED {hasTables ? 'WITH TABLES' : 'TEXT'} ({extracted.length} chars)
+                EXTRACTED {hasTables ? 'WITH TABLES & LISTS' : 'TEXT'} ({extracted.length} chars) — AUTO-IMPROVED
               </label>
               <span style={{ fontSize: 11, color: hasTables ? 'var(--gold)' : 'var(--text-tertiary)', fontWeight: 700 }}>
-                {hasTables ? '📊 Tables will be formatted professionally' : '📝 Plain text'}
+                {hasTables ? '📊 Tables + 📝 Bullets auto-detected' : '✨ Paragraphs & bullets auto-added'}
               </span>
             </div>
 
@@ -526,8 +517,8 @@ function ImportDocModal({ open, onClose, onExtracted }) {
                 <div className="input-glass" style={{ maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 12, lineHeight: 1.5 }}>{extracted.slice(0, 3000)}{extracted.length > 3000 ? '\n... (truncated)' : ''}</div>
               </div>
               <div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PREVIEW ON LETTERHEAD</div>
-                <div className="glass" style={{ maxHeight: 220, overflowY: 'auto', padding: 12, borderRadius: 12, fontSize: 11, lineHeight: 1.5 }} dangerouslySetInnerHTML={{ __html: formatToHtml(extracted, extractedHtml).slice(0, 5000) }} />
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PROFESSIONAL PREVIEW ON LETTERHEAD</div>
+                <div className="glass" style={{ maxHeight: 220, overflowY: 'auto', padding: 12, borderRadius: 12, fontSize: 11, lineHeight: 1.5 }} dangerouslySetInnerHTML={{ __html: formatToHtml(extracted, extractedHtml).slice(0, 8000) }} />
               </div>
             </div>
 
@@ -536,7 +527,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
                 const html = formatToHtml(extracted, extractedHtml)
                 onExtracted(html, extracted)
                 onClose()
-              }}>✨ {hasTables ? 'Format Tables & Text on Letterhead' : 'Put on Letterhead'}</button>
+              }}>✨ {hasTables ? 'Format Tables, Bullets & Text' : 'Auto-Improve & Put on Letterhead'}</button>
               <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => {
                 const lines = extracted.split('\n').filter(l => l.trim()).slice(0,5)
                 const subject = lines.find(l => l.toLowerCase().includes('subject:'))?.replace(/subject:/i,'').trim() || ''
@@ -547,9 +538,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
             </div>
 
             <div className="glass" style={{ marginTop: 14, padding: 12, borderRadius: 12, fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-              <strong>🧠 Smart formatting:</strong> 
-              {hasTables ? ' Tables detected — will be rendered with professional black header + gold border, alternating rows, right-aligned numbers, and kept together on one page.' : ' Plain text — split into paragraphs with headings preserved.'}
-              <br/>All content flows across pages: Page 1 uses Letter 1 background, rest use Letter 2. Tables are never split awkwardly.
+              <strong>🧠 Smart auto-improve:</strong> Cleans extra spaces, splits long text into paragraphs (2-3 sentences), detects headings (ALL CAPS or ending with :), converts lines starting with - • * 1. into bullet/numbered lists, preserves tables with black header + gold border. Date is now on right side of letter. All flows across pages with Letter 1 on page 1, Letter 2 on rest.
             </div>
           </div>
         )}
@@ -557,6 +546,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
     </div>
   )
 }
+
 
 // ---------- Preview ----------
 function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true }) {
@@ -586,9 +576,9 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
       </div>`
     return `
       <div style="font-family:'Nunito Sans', sans-serif; font-size:11.5pt; line-height:1.6; color:#111">
-        <div style="display:flex; justify-content:space-between; margin-bottom:10px; font-size:10.5pt">
-          <div>${dateStr}</div>
+        <div style="display:flex; justify-content:space-between; margin-bottom:12px; font-size:10.5pt; align-items:flex-start">
           <div style="font-weight:700">Ref: ${ref}</div>
+          <div style="text-align:right; font-weight:500">${dateStr}</div>
         </div>
         ${recip}
         ${subject}
@@ -838,11 +828,11 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
     return false
   }
 
-  // Date & Ref
-  page.drawText(dateStr, { x: bounds.left, y: cursorY, size: 10, font: fontMed, color: rgb(0.1, 0.1, 0.1) })
+  // Date & Ref - Date on right side (per user request)
   const refText = `Ref: ${ref}`
-  const refW = fontBold.widthOfTextAtSize(refText, 10)
-  page.drawText(refText, { x: bounds.right - refW, y: cursorY, size: 10, font: fontBold })
+  page.drawText(refText, { x: bounds.left, y: cursorY, size: 10, font: fontBold, color: rgb(0.1, 0.1, 0.1) })
+  const dateW = fontMed.widthOfTextAtSize(dateStr, 10)
+  page.drawText(dateStr, { x: bounds.right - dateW, y: cursorY, size: 10, font: fontMed, color: rgb(0.1, 0.1, 0.1) })
   cursorY -= 24
 
   // Recipient

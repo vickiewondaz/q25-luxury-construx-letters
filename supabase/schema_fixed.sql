@@ -1,10 +1,10 @@
--- Q25 Luxury Construx - Supabase Schema
+-- Q25 Luxury Construx - Supabase Schema - FIXED (primary key syntax)
 -- Run this once in Supabase SQL Editor
 
 -- Enable UUID extension
 create extension if not exists "uuid-ossp";
 
--- PROFILES table (extends auth.users with role)
+-- PROFILES table (extends auth.users with role) - FIXED: primary key
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   email text,
@@ -23,8 +23,8 @@ create table if not exists public.letters (
   recipient_address text,
   subject text not null,
   salutation text default 'Dear Sir/Madam,',
-  body text, -- rich HTML
-  body_json jsonb, -- optional structured
+  body text,
+  body_json jsonb,
   letter_date date default current_date,
   closing_line text default 'Yours sincerely,',
   signature_applied boolean default true,
@@ -46,7 +46,7 @@ create table if not exists public.templates (
   created_at timestamptz default now()
 );
 
--- Indexes for search and performance (as requested)
+-- Indexes
 create index if not exists idx_letters_reference_no on public.letters(reference_no);
 create index if not exists idx_letters_recipient on public.letters(recipient_name);
 create index if not exists idx_letters_subject on public.letters(subject);
@@ -84,7 +84,6 @@ begin
   select coalesce(max((regexp_match(reference_no, '/(\d+)$'))[1]::int),0) into max_num
   from public.letters
   where reference_no like prefix || '%';
-
   next_num := max_num + 1;
   return prefix || lpad(next_num::text, 3, '0');
 end;
@@ -95,12 +94,7 @@ alter table public.letters enable row level security;
 alter table public.templates enable row level security;
 alter table public.profiles enable row level security;
 
--- RLS Policies: users only see authorised letters
--- For simplicity, allow all authenticated users to read/write their own letters
--- Admin can see all, staff only theirs (enforced via policies below)
--- NOTE: Adjust role logic as needed; profiles.role controls admin
-
--- Letters policies
+-- RLS Policies
 drop policy if exists "Users can view their own letters or admin all" on public.letters;
 create policy "Users can view their own letters or admin all"
 on public.letters for select
@@ -134,7 +128,6 @@ using (
   or exists (select 1 from public.profiles where id = auth.uid() and role = 'admin')
 );
 
--- Templates policies
 drop policy if exists "Users manage own templates" on public.templates;
 create policy "Users manage own templates"
 on public.templates for all
@@ -148,7 +141,6 @@ on public.templates for select
 to authenticated
 using (exists (select 1 from public.profiles where id = auth.uid() and role = 'admin'));
 
--- Profiles policies
 drop policy if exists "Users view own profile" on public.profiles;
 create policy "Users view own profile"
 on public.profiles for select
@@ -161,13 +153,13 @@ on public.profiles for update
 to authenticated
 using (auth.uid() = id);
 
--- Auto-create profile on signup - UPDATED: any Gmail is admin (per user request)
+-- Auto-create profile on signup - any Gmail is admin
 create or replace function public.handle_new_user()
 returns trigger as $$
 begin
   insert into public.profiles (id, email, role)
   values (new.id, new.email, 'admin')
-  on conflict (id) do nothing;
+  on conflict (id) do update set role = 'admin', email = excluded.email;
   return new;
 end;
 $$ language plpgsql security definer;
@@ -177,17 +169,8 @@ create trigger on_auth_user_created
 after insert on auth.users
 for each row execute function public.handle_new_user();
 
--- Storage bucket for PDFs (create via dashboard or SQL)
--- Note: Create bucket 'letter-pdfs' as private via Storage UI, then run policies below
--- If using SQL for bucket creation (requires supabase admin):
--- insert into storage.buckets (id, name, public) values ('letter-pdfs','letter-pdfs', false) on conflict do nothing;
-
--- Storage policies (run after bucket exists)
--- drop policy if exists "Authenticated can upload pdfs" on storage.objects;
--- create policy "Authenticated can upload pdfs" on storage.objects for insert to authenticated with check (bucket_id = 'letter-pdfs');
--- drop policy if exists "Users can read own pdfs, admin all" on storage.objects;
--- create policy "Users can read own pdfs, admin all" on storage.objects for select to authenticated using (bucket_id = 'letter-pdfs');
--- drop policy if exists "Users can update own pdfs" on storage.objects;
--- create policy "Users can update own pdfs" on storage.objects for update to authenticated using (bucket_id = 'letter-pdfs');
--- drop policy if exists "Users can delete own pdfs" on storage.objects;
--- create policy "Users can delete own pdfs" on storage.objects for delete to authenticated using (bucket_id = 'letter-pdfs');
+-- Make all existing users admin (if any)
+update public.profiles set role = 'admin';
+insert into public.profiles (id, email, role)
+select id, email, 'admin' from auth.users
+on conflict (id) do update set role = 'admin';

@@ -162,17 +162,38 @@ function ImportDocModal({ open, onClose, onExtracted }) {
       if (type === 'application/pdf' || ext === 'pdf') {
         setStatus('Extracting PDF (pdf.js)...')
         const pdfjsLib = await import('pdfjs-dist')
-        // Fix: Use local worker to match API version (was 4.10.38 vs 4.4.168 mismatch)
+        // Robust worker setup - use bundled worker, disable if mismatch
         try {
           const workerSrc = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
           pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc.default
-        } catch {
-          // Fallback to CDN with same version as API
-          const version = pdfjsLib.version || '4.10.38'
-          pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
+        } catch (e) {
+          console.warn('Local worker import failed, trying CDN', e)
+          try {
+            const version = pdfjsLib.version || '4.10.38'
+            pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
+          } catch {}
         }
         const buf = await file.arrayBuffer()
-        const pdf = await pdfjsLib.getDocument({ data: buf }).promise
+        let pdf
+        try {
+          pdf = await pdfjsLib.getDocument({ data: buf }).promise
+        } catch (err) {
+          // Fallback: version mismatch or worker failed - try without worker
+          if (err.message && err.message.includes('API version') && err.message.includes('Worker version')) {
+            setStatus('Worker version mismatch, retrying without worker...')
+            console.warn('PDF.js version mismatch, retrying with disableWorker', err)
+            try {
+              pdfjsLib.GlobalWorkerOptions.workerSrc = ''
+              pdf = await pdfjsLib.getDocument({ data: buf, disableWorker: true }).promise
+            } catch (e2) {
+              // Last resort: try legacy build
+              const pdfjsLegacy = await import('pdfjs-dist/legacy/build/pdf.mjs')
+              pdf = await pdfjsLegacy.getDocument({ data: buf }).promise
+            }
+          } else {
+            throw err
+          }
+        }
         let full = ''
         for (let i = 1; i <= pdf.numPages; i++) {
           setProgress(Math.round((i / pdf.numPages) * 80))

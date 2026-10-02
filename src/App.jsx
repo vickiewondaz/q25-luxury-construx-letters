@@ -1540,17 +1540,25 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
           }
 
           const remaining = currentUsable - currentHeight
-          // If heading + table start doesn't fit and we have content on page, move BOTH to next page
+          // HEADINGS WITH TABLES ALWAYS STAY TOGETHER, but avoid blank spaces
+          // If combined doesn't fit, check remaining space
           if (combinedNeeded > remaining && currentPageBlocks.length > 0) {
-            pages.push(currentPageBlocks)
-            currentPageBlocks = []
-            currentHeight = 0
-            currentUsable = p2Usable
+            if (remaining < 160) {
+              // Small remaining - move BOTH heading and table to next page to avoid tiny chunk and blank
+              pages.push(currentPageBlocks)
+              currentPageBlocks = []
+              currentHeight = 0
+              currentUsable = p2Usable
+            } else {
+              // Large remaining - keep heading on current page, table will split and fill remaining
+              // This avoids large blank spaces (like 600px blank in screenshot)
+              // Add heading now, table will be handled next and will fill remaining with rows
+            }
           }
-          // Now add heading (will stay with table on same page)
+          // Now add heading (will stay with table on same page, or at least start table on same page if large remaining)
           currentPageBlocks.push({ ...blk, measuredHeight: headingH })
           currentHeight += headingH
-          continue // Next iteration will handle the table (now on same page as heading)
+          continue // Next iteration will handle the table (now on same page as heading, splitting rows to fill space)
         }
 
         // Handle tables with row splitting
@@ -1585,12 +1593,17 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
           let remaining = currentUsable - currentHeight
           const firstRowHeight = rowHeights[0] || 40
           
+          // If table header + first row doesn't fit, but remaining is large, still try to start table and split
+          // Only move to next page if remaining is small (<120px) to avoid tiny blank
           if (headerHeight + firstRowHeight > remaining && currentPageBlocks.length > 0) {
-            pages.push(currentPageBlocks)
-            currentPageBlocks = []
-            currentHeight = 0
-            currentUsable = p2Usable
-            remaining = currentUsable
+            if (remaining < 120) {
+              pages.push(currentPageBlocks)
+              currentPageBlocks = []
+              currentHeight = 0
+              currentUsable = p2Usable
+              remaining = currentUsable
+            }
+            // Else: large remaining - keep table on current page, it will split rows to fill space (no blank)
           }
 
           let currentTableRows = []
@@ -1953,27 +1966,50 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
         } catch {}
       }
 
-      // Check if need new page - don't mix, move entire block if no space
+      // Check if need new page - HEADINGS WITH TABLES ALWAYS STAY TOGETHER, but avoid blank spaces
       if (cursorY - estimatedHeight < bounds.bottom) {
-        // If block is heading and next block is paragraph, keep them together if possible
         const nextBlock = blocks[bIdx+1]
         const isHeading = block.type === 'heading'
         const nextIsPara = nextBlock && (nextBlock.type === 'paragraph' || nextBlock.type === 'table')
+        const nextIsTable = nextBlock && nextBlock.isTable
+        const remaining = cursorY - bounds.bottom
         
-        if (isHeading && nextIsPara) {
-          // Heading + content should stay together if possible
+        if (isHeading && nextIsTable) {
+          // Heading + table must stay together - but avoid large blank spaces
+          const combinedHeight = estimatedHeight + (nextBlock.heightEstimate||80) + 10
+          if (cursorY - combinedHeight < bounds.bottom && cursorY < bounds.top - 50) {
+            if (remaining < 100) {
+              // Small remaining - move both to next page
+              page = addPage()
+              bounds = drawContentOnPage(currentPageIndex - 1)
+              cursorY = bounds.top - 18
+            }
+            // Else large remaining - keep heading on current page, table will split and fill space (no blank)
+          }
+        } else if (isHeading && nextIsPara) {
           const combinedHeight = estimatedHeight + (nextBlock.heightEstimate||50) + 10
           if (cursorY - combinedHeight < bounds.bottom && cursorY < bounds.top - 50) {
-            // Not enough space for heading + next, move heading to next page
+            if (remaining < 80) {
+              page = addPage()
+              bounds = drawContentOnPage(currentPageIndex - 1)
+              cursorY = bounds.top - 18
+            }
+          }
+        } else if (cursorY < bounds.top - 60) {
+          // Has content, need new page - but avoid blank if table can split
+          if (block.type === 'table') {
+            const remaining = cursorY - bounds.bottom
+            if (remaining < 80) {
+              page = addPage()
+              bounds = drawContentOnPage(currentPageIndex - 1)
+              cursorY = bounds.top - 18
+            }
+            // Else keep table on current page, it will split rows to fill space
+          } else {
             page = addPage()
             bounds = drawContentOnPage(currentPageIndex - 1)
             cursorY = bounds.top - 18
           }
-        } else if (cursorY < bounds.top - 60) {
-          // Has content, need new page
-          page = addPage()
-          bounds = drawContentOnPage(currentPageIndex - 1)
-          cursorY = bounds.top - 18
         }
       }
 

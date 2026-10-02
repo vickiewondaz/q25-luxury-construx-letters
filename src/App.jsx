@@ -128,7 +128,27 @@ function RichToolbar({ editorRef }) {
   )
 }
 
-// ---------- Document Import with SMART Table Auto-Detection & Error Fixing ----------
+// ---------- Error Boundary ----------
+class ErrorBoundary extends React.Component {
+  constructor(props){ super(props); this.state = { hasError: false, error: null } }
+  static getDerivedStateFromError(error){ return { hasError: true, error } }
+  componentDidCatch(error, info){ console.error('ErrorBoundary caught', error, info) }
+  render(){
+    if (this.state.hasError){
+      return (
+        <div style={{ padding: 20, background: '#fff3f3', border: '1px solid #ffcdd2', borderRadius: 12, margin: 20 }}>
+          <h3 style={{ color: '#b71c1c' }}>⚠️ Something went wrong</h3>
+          <p style={{ fontSize: 13, color: '#555', marginTop: 8 }}>{this.state.error?.message || 'Unknown error'}</p>
+          <pre style={{ fontSize: 11, background: '#fff', padding: 10, borderRadius: 8, overflow: 'auto', maxHeight: 200, marginTop: 10 }}>{this.state.error?.stack?.slice(0,1000)}</pre>
+          <button className="btn-gold" style={{ marginTop: 12, padding: '8px 16px', fontSize: 12 }} onClick={()=>{ this.setState({ hasError: false, error: null }); if(this.props.onReset) this.props.onReset(); window.location.reload() }}>Reload App</button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+// ---------- Document Import with SMART Table Auto-Detection & Error Fixing - ROBUST ----------
 function ImportDocModal({ open, onClose, onExtracted }) {
   const [dragOver, setDragOver] = useState(false)
   const [status, setStatus] = useState('')
@@ -139,764 +159,716 @@ function ImportDocModal({ open, onClose, onExtracted }) {
   const [isBOQ, setIsBOQ] = useState(false)
   const [boqData, setBoqData] = useState(null)
   const [tableStats, setTableStats] = useState(null)
+  const [errorMsg, setErrorMsg] = useState('')
   const fileRef = useRef(null)
 
-  // ---------- SMART TABLE ENGINE ----------
+  // Reset on open
+  useEffect(() => {
+    if (open) {
+      setErrorMsg('')
+      setStatus('')
+      setProgress(0)
+    }
+  }, [open])
+
   const HEADER_KEYWORDS = ['item','description','qty','quantity','unit','rate','amount','price','total','cost','s/n','no','material','work','particulars','details','specification','remarks','nos','uom']
 
   const cleanCell = (c) => {
-    if (!c) return ''
-    let s = c.trim().replace(/\s+/g, ' ')
-    // Fix common OCR errors
-    s = s.replace(/m2\b/gi, 'm²').replace(/m3\b/gi, 'm³').replace(/\bSqm\b/g, 'm²')
-    s = s.replace(/l\b/g, '').trim() // placeholder
-    // Fix unit errors
-    s = s.replace(/\bM2\b/g, 'm²').replace(/\bM3\b/g, 'm³').replace(/\bLS\b/g, 'LS')
-    return s
+    try {
+      if (!c) return ''
+      let s = c.trim().replace(/\s+/g, ' ')
+      s = s.replace(/m2\b/gi, 'm²').replace(/m3\b/gi, 'm³').replace(/\bSqm\b/g, 'm²')
+      s = s.replace(/\bM2\b/g, 'm²').replace(/\bM3\b/g, 'm³').replace(/\bLS\b/g, 'LS')
+      return s.slice(0, 200)
+    } catch { return (c||'').toString().slice(0,200) }
   }
 
   const isNumericCell = (c) => {
-    const t = c.replace(/[₦$,\s]/g, '').trim()
-    return /^-?\d+(\.\d+)?$/.test(t) || /^-?\d{1,3}(,\d{3})*(\.\d+)?$/.test(c.trim())
+    try {
+      const t = (c||'').toString().replace(/[₦$,\s]/g, '').trim()
+      return /^-?\d+(\.\d+)?$/.test(t) || /^-?\d{1,3}(,\d{3})*(\.\d+)?$/.test((c||'').toString().trim())
+    } catch { return false }
   }
 
   const isHeaderRow = (cells) => {
-    if (!cells || cells.length === 0) return false
-    const joined = cells.join(' ').toLowerCase()
-    const keywordCount = HEADER_KEYWORDS.filter(k => joined.includes(k)).length
-    const hasNumber = cells.some(isNumericCell)
-    const allUpperOrTitle = cells.every(c => c.length < 30 && (c.toUpperCase() === c || /^[A-Z][a-z]+/.test(c)))
-    // Header if: has keywords and no numbers, or first row and looks like header
-    if (keywordCount >= 2 && !hasNumber) return true
-    if (keywordCount >= 1 && cells.length >= 3 && !cells.some(c => /^\d{1,3}(,\d{3})+/.test(c))) {
-      // Might be header if next rows have numbers
-      return true
-    }
-    // If all cells short and no pure numbers
-    if (cells.length >= 2 && cells.every(c => c.length < 25 && !/^\d+$/.test(c.trim()) && !isNumericCell(c))) {
-      if (keywordCount >= 1) return true
-    }
-    return false
+    try {
+      if (!cells || cells.length === 0) return false
+      const joined = cells.join(' ').toLowerCase()
+      const keywordCount = HEADER_KEYWORDS.filter(k => joined.includes(k)).length
+      const hasNumber = cells.some(isNumericCell)
+      if (keywordCount >= 2 && !hasNumber) return true
+      if (keywordCount >= 1 && cells.length >= 3 && !cells.some(c => /^\d{1,3}(,\d{3})+/.test(c))) return true
+      if (cells.length >= 2 && cells.every(c => c.length < 25 && !/^\d+$/.test(c.trim()) && !isNumericCell(c))) {
+        if (keywordCount >= 1) return true
+      }
+      return false
+    } catch { return false }
   }
 
   const splitLineToCells = (line) => {
-    const trimmed = line.trim()
-    if (!trimmed) return []
-    // Try tab first - most reliable
-    if (trimmed.includes('\t')) {
-      const parts = trimmed.split('\t').map(cleanCell).filter(p => p.length > 0)
-      if (parts.length >= 2) return parts
-    }
-    // Try pipe |
-    if (trimmed.includes('|')) {
-      const parts = trimmed.split('|').map(cleanCell).filter(p => p.length > 0)
-      if (parts.length >= 2) return parts
-    }
-    // Try 3+ spaces or 2+ spaces with pattern
-    const multiSpaceParts = trimmed.split(/\s{3,}|\t/).map(cleanCell).filter(Boolean)
-    if (multiSpaceParts.length >= 3) return multiSpaceParts
-
-    // Try 2+ spaces but need at least 3 columns
-    const doubleSpaceParts = trimmed.split(/\s{2,}/).map(cleanCell).filter(Boolean)
-    if (doubleSpaceParts.length >= 3) {
-      // Validate: last 2-3 columns should be numeric or unit-like for BOQ style
-      return doubleSpaceParts
-    }
-
-    // Try to detect BOQ style: Description + Unit + Qty + Rate + Amount
-    // Pattern: text ... (LS|m²|m³|m|No|tonne) number number number
-    const boqMatch = trimmed.match(/^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?|Nos?\.?|Set|Lot|Sum|Item)\s+([0-9\.\-—]+)\s+([0-9,\.\s]+)\s+([0-9,\.]+)$/i)
-    if (boqMatch) {
-      return [cleanCell(boqMatch[1]), cleanCell(boqMatch[2]), cleanCell(boqMatch[3]), cleanCell(boqMatch[4]), cleanCell(boqMatch[5])]
-    }
-
-    // Try generic: text followed by numbers
-    // e.g. "Cement 20 bags 50000 1000000"
-    const genericNumMatch = trimmed.match(/^(.+?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s*$/)
-    if (genericNumMatch) {
-      return [cleanCell(genericNumMatch[1]), cleanCell(genericNumMatch[2]), cleanCell(genericNumMatch[3]), cleanCell(genericNumMatch[4])]
-    }
-
-    // Not a table row
-    return []
+    try {
+      const trimmed = (line||'').trim()
+      if (!trimmed) return []
+      if (trimmed.includes('\t')) {
+        const parts = trimmed.split('\t').map(cleanCell).filter(p => p.length > 0)
+        if (parts.length >= 2) return parts
+      }
+      if (trimmed.includes('|')) {
+        const parts = trimmed.split('|').map(cleanCell).filter(p => p.length > 0)
+        if (parts.length >= 2) return parts
+      }
+      const multiSpaceParts = trimmed.split(/\s{3,}|\t/).map(cleanCell).filter(Boolean)
+      if (multiSpaceParts.length >= 3) return multiSpaceParts
+      const doubleSpaceParts = trimmed.split(/\s{2,}/).map(cleanCell).filter(Boolean)
+      if (doubleSpaceParts.length >= 3) return doubleSpaceParts
+      const boqMatch = trimmed.match(/^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?|Nos?\.?|Set|Lot|Sum|Item)\s+([0-9\.\-—]+)\s+([0-9,\.\s]+)\s+([0-9,\.]+)$/i)
+      if (boqMatch) {
+        return [cleanCell(boqMatch[1]), cleanCell(boqMatch[2]), cleanCell(boqMatch[3]), cleanCell(boqMatch[4]), cleanCell(boqMatch[5])]
+      }
+      const genericNumMatch = trimmed.match(/^(.+?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s*$/)
+      if (genericNumMatch) {
+        return [cleanCell(genericNumMatch[1]), cleanCell(genericNumMatch[2]), cleanCell(genericNumMatch[3]), cleanCell(genericNumMatch[4])]
+      }
+      return []
+    } catch { return [] }
   }
 
   const scoreTableLine = (line) => {
-    const cells = splitLineToCells(line)
-    if (cells.length < 2) return 0
-    if (cells.length > 10) return 0.2
-    let score = 0
-    score += Math.min(cells.length * 0.2, 0.6) // more columns = higher
-    if (cells.some(isNumericCell)) score += 0.3
-    if (cells.some(c => /^(LS|m²|m³|No|tonne)$/i.test(c.trim()))) score += 0.3
-    if (line.includes('\t') || line.includes('|')) score += 0.2
-    if (/\s{3,}/.test(line)) score += 0.15
-    // Penalize very long first cell that looks like paragraph
-    if (cells[0].length > 120) score -= 0.3
-    return Math.min(Math.max(score, 0), 1)
+    try {
+      const cells = splitLineToCells(line)
+      if (cells.length < 2) return 0
+      if (cells.length > 10) return 0.2
+      let score = 0
+      score += Math.min(cells.length * 0.2, 0.6)
+      if (cells.some(isNumericCell)) score += 0.3
+      if (cells.some(c => /^(LS|m²|m³|No|tonne)$/i.test(c.trim()))) score += 0.3
+      if (line.includes('\t') || line.includes('|')) score += 0.2
+      if (/\s{3,}/.test(line)) score += 0.15
+      if (cells[0].length > 120) score -= 0.3
+      return Math.min(Math.max(score, 0), 1)
+    } catch { return 0 }
   }
 
   const detectTableBlocks = (text) => {
-    const lines = text.split('\n')
-    const blocks = []
-    let currentTable = []
-    let currentText = []
-    let tableStartIdx = -1
+    try {
+      const limitedText = (text||'').slice(0, 80000)
+      const lines = limitedText.split('\n').slice(0, 2000)
+      const blocks = []
+      let currentTable = []
+      let currentText = []
+      let tableStartIdx = -1
 
-    const flushText = () => {
-      if (currentText.length) {
-        const txt = currentText.join('\n').trim()
-        if (txt) blocks.push({ type: 'text', content: txt, lines: [...currentText] })
-        currentText = []
-      }
-    }
-    const flushTable = () => {
-      if (currentTable.length >= 2) {
-        // Validate table: need consistent column counts
-        const colCounts = currentTable.map(r => r.cells.length)
-        const avgCols = colCounts.reduce((a,b)=>a+b,0)/colCounts.length
-        const consistent = colCounts.filter(c => Math.abs(c - avgCols) <= 1).length >= currentTable.length * 0.7
-        if (consistent && avgCols >= 2) {
-          blocks.push({ type: 'table', rows: [...currentTable], startLine: tableStartIdx })
-        } else {
-          // Not consistent enough, treat as text
-          const txt = currentTable.map(r => r.raw).join('\n')
-          blocks.push({ type: 'text', content: txt, lines: currentTable.map(r=>r.raw) })
-        }
-      } else if (currentTable.length === 1) {
-        // Single row table-like line - might be text, but if score high, keep as 1-row table?
-        // Treat as text to be safe unless very table-like
-        if (currentTable[0].score > 0.8) {
-          blocks.push({ type: 'table', rows: [...currentTable], startLine: tableStartIdx })
-        } else {
-          blocks.push({ type: 'text', content: currentTable[0].raw, lines: [currentTable[0].raw] })
+      const flushText = () => {
+        if (currentText.length) {
+          const txt = currentText.join('\n').trim()
+          if (txt) blocks.push({ type: 'text', content: txt, lines: [...currentText] })
+          currentText = []
         }
       }
-      currentTable = []
-      tableStartIdx = -1
+      const flushTable = () => {
+        if (currentTable.length >= 2) {
+          const colCounts = currentTable.map(r => r.cells.length)
+          const avgCols = colCounts.reduce((a,b)=>a+b,0)/colCounts.length
+          const consistent = colCounts.filter(c => Math.abs(c - avgCols) <= 1).length >= currentTable.length * 0.7
+          if (consistent && avgCols >= 2) {
+            blocks.push({ type: 'table', rows: [...currentTable], startLine: tableStartIdx })
+          } else {
+            const txt = currentTable.map(r => r.raw).join('\n')
+            blocks.push({ type: 'text', content: txt, lines: currentTable.map(r=>r.raw) })
+          }
+        } else if (currentTable.length === 1) {
+          if (currentTable[0].score > 0.8) {
+            blocks.push({ type: 'table', rows: [...currentTable], startLine: tableStartIdx })
+          } else {
+            blocks.push({ type: 'text', content: currentTable[0].raw, lines: [currentTable[0].raw] })
+          }
+        }
+        currentTable = []
+        tableStartIdx = -1
+      }
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i] || ''
+        const trimmed = line.trim()
+        if (!trimmed) {
+          if (currentTable.length) flushTable()
+          currentText.push(line)
+          continue
+        }
+        const score = scoreTableLine(line)
+        const cells = splitLineToCells(line)
+        let nextScores = []
+        for (let j = 1; j <= 2; j++) {
+          if (i+j < lines.length) nextScores.push(scoreTableLine(lines[i+j]||''))
+        }
+        const avgNext = nextScores.length ? nextScores.reduce((a,b)=>a+b,0)/nextScores.length : 0
+        const isTable = (score >= 0.5 && (cells.length >= 2)) || (score >= 0.4 && avgNext >= 0.5 && cells.length >= 2)
+
+        if (isTable) {
+          if (currentText.length) flushText()
+          if (tableStartIdx === -1) tableStartIdx = i
+          currentTable.push({ raw: line, cells, score, lineIndex: i })
+        } else {
+          if (currentTable.length) flushTable()
+          currentText.push(line)
+        }
+      }
+      if (currentTable.length) flushTable()
+      if (currentText.length) flushText()
+      return blocks
+    } catch (e) {
+      console.warn('detectTableBlocks failed', e)
+      return [{ type: 'text', content: (text||'').slice(0,5000), lines: [] }]
     }
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-      const trimmed = line.trim()
-      if (!trimmed) {
-        // Empty line - breaks table
-        if (currentTable.length) flushTable()
-        currentText.push(line)
-        continue
-      }
-      const score = scoreTableLine(line)
-      const cells = splitLineToCells(line)
-
-      // Check if next lines also look like table to confirm
-      let nextScores = []
-      for (let j = 1; j <= 2; j++) {
-        if (i+j < lines.length) nextScores.push(scoreTableLine(lines[i+j]))
-      }
-      const avgNext = nextScores.length ? nextScores.reduce((a,b)=>a+b,0)/nextScores.length : 0
-
-      const isTable = (score >= 0.5 && (cells.length >= 2)) || (score >= 0.4 && avgNext >= 0.5 && cells.length >= 2)
-
-      if (isTable) {
-        if (currentText.length) flushText()
-        if (tableStartIdx === -1) tableStartIdx = i
-        currentTable.push({ raw: line, cells, score, lineIndex: i })
-      } else {
-        if (currentTable.length) flushTable()
-        currentText.push(line)
-      }
-    }
-    if (currentTable.length) flushTable()
-    if (currentText.length) flushText()
-
-    return blocks
   }
 
   const fixTableErrors = (tableBlock) => {
-    let rows = tableBlock.rows.map(r => [...r.cells])
-    if (rows.length === 0) return { headers: [], rows: [], fixed: [] }
-
-    const fixes = []
-
-    // Step 1: Normalize column count - find most common col count
-    const colCounts = rows.map(r => r.length)
-    const freq = {}
-    colCounts.forEach(c => freq[c] = (freq[c]||0)+1)
-    let targetCols = parseInt(Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0])
-
-    // If targetCols is 1 but we have many rows, maybe it's not a table
-    if (targetCols < 2) return { headers: [], rows: [], fixed: ['Not a table'] }
-
-    // Step 2: Fix rows with wrong column count
-    let fixedRows = []
-    let i = 0
-    while (i < rows.length) {
-      let row = rows[i]
-      if (row.length === targetCols) {
-        fixedRows.push(row)
-      } else if (row.length < targetCols) {
-        // Check if next line is continuation of description (multiline)
-        if (i+1 < rows.length && rows[i+1].length < targetCols && rows[i+1].length === 1) {
-          // Merge: append next line to first cell
-          const merged = [...row]
-          merged[0] = merged[0] + ' ' + rows[i+1][0]
-          // Pad if still short
-          while (merged.length < targetCols) merged.push('')
-          fixedRows.push(merged)
-          fixes.push(`Merged multiline row at line ${i}`)
-          i++ // skip next
-        } else if (row.length === targetCols - 1) {
-          // Missing one column - maybe rate and amount merged? Try split last cell if contains two numbers
-          const last = row[row.length-1]
-          const twoNums = last.match(/([0-9,]+\.?\d*)\s+([0-9,]+\.?\d*)$/)
-          if (twoNums) {
-            const newRow = [...row]
-            newRow[newRow.length-1] = twoNums[1]
-            newRow.push(twoNums[2])
-            fixedRows.push(newRow)
-            fixes.push(`Split merged numbers at row ${i}`)
+    try {
+      let rows = (tableBlock.rows||[]).map(r => [...(r.cells||[])])
+      if (rows.length === 0) return { headers: [], rows: [], fixed: [] }
+      const colCounts = rows.map(r => r.length)
+      const freq = {}
+      colCounts.forEach(c => freq[c] = (freq[c]||0)+1)
+      let targetCols = parseInt(Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0])
+      if (targetCols < 2) return { headers: [], rows: [], fixed: ['Not a table'] }
+      const fixes = []
+      let fixedRows = []
+      let i = 0
+      while (i < rows.length) {
+        let row = rows[i] || []
+        if (row.length === targetCols) {
+          fixedRows.push(row)
+        } else if (row.length < targetCols) {
+          if (i+1 < rows.length && rows[i+1].length < targetCols && rows[i+1].length === 1) {
+            const merged = [...row]
+            merged[0] = (merged[0]||'') + ' ' + (rows[i+1][0]||'')
+            while (merged.length < targetCols) merged.push('')
+            fixedRows.push(merged)
+            fixes.push(`Merged multiline row at line ${i}`)
+            i++
+          } else if (row.length === targetCols - 1) {
+            const last = row[row.length-1]||''
+            const twoNums = last.match(/([0-9,]+\.?\d*)\s+([0-9,]+\.?\d*)$/)
+            if (twoNums) {
+              const newRow = [...row]
+              newRow[newRow.length-1] = twoNums[1]
+              newRow.push(twoNums[2])
+              fixedRows.push(newRow)
+              fixes.push(`Split merged numbers at row ${i}`)
+            } else {
+              const padded = [...row]
+              while (padded.length < targetCols) padded.push('')
+              fixedRows.push(padded)
+              fixes.push(`Padded missing columns at row ${i}`)
+            }
           } else {
-            // Pad
             const padded = [...row]
             while (padded.length < targetCols) padded.push('')
             fixedRows.push(padded)
-            fixes.push(`Padded missing columns at row ${i}`)
           }
-        } else {
-          // Too few, pad
-          const padded = [...row]
-          while (padded.length < targetCols) padded.push('')
-          fixedRows.push(padded)
+        } else if (row.length > targetCols) {
+          if (targetCols >= 3) {
+            const extra = row.length - targetCols
+            const desc = row.slice(0, extra+1).join(' ')
+            const rest = row.slice(extra+1)
+            fixedRows.push([desc, ...rest])
+            fixes.push(`Merged split description at row ${i}`)
+          } else {
+            fixedRows.push(row.slice(0, targetCols))
+            fixes.push(`Trimmed extra columns at row ${i}`)
+          }
         }
-      } else if (row.length > targetCols) {
-        // Too many - merge extra into description or last
-        if (targetCols >= 3) {
-          // Assume first cell is description that got split
-          const extra = row.length - targetCols
-          const desc = row.slice(0, extra+1).join(' ')
-          const rest = row.slice(extra+1)
-          fixedRows.push([desc, ...rest])
-          fixes.push(`Merged split description at row ${i}`)
-        } else {
-          fixedRows.push(row.slice(0, targetCols))
-          fixes.push(`Trimmed extra columns at row ${i}`)
-        }
+        i++
       }
-      i++
-    }
-
-    rows = fixedRows
-
-    // Step 3: Detect header
-    let headers = []
-    let dataRows = rows
-    let hasHeader = false
-
-    if (rows.length >= 2) {
-      const first = rows[0]
-      if (isHeaderRow(first)) {
-        headers = first
-        dataRows = rows.slice(1)
-        hasHeader = true
-        fixes.push('Detected header row')
-      } else {
-        // Check if first row has no numbers and second row has numbers -> first is header
-        const firstHasNum = first.some(isNumericCell)
-        const secondHasNum = rows[1].some(isNumericCell)
-        if (!firstHasNum && secondHasNum) {
+      rows = fixedRows
+      let headers = []
+      let dataRows = rows
+      let hasHeader = false
+      if (rows.length >= 2) {
+        const first = rows[0]
+        if (isHeaderRow(first)) {
           headers = first
           dataRows = rows.slice(1)
           hasHeader = true
-          fixes.push('Inferred header (no numbers in first row)')
+          fixes.push('Detected header row')
+        } else {
+          const firstHasNum = first.some(isNumericCell)
+          const secondHasNum = rows[1].some(isNumericCell)
+          if (!firstHasNum && secondHasNum) {
+            headers = first
+            dataRows = rows.slice(1)
+            hasHeader = true
+            fixes.push('Inferred header')
+          }
         }
       }
-    }
-
-    // Step 4: If no header, auto-generate based on content
-    if (!hasHeader) {
-      // Check if BOQ style
-      const hasUnits = rows.some(r => r.some(c => /^(LS|m²|m³|m\b|tonne|No\.?)$/i.test(c.trim())))
-      if (hasUnits && targetCols >= 4) {
-        if (targetCols === 5) headers = ['Description', 'Unit', 'Qty', 'Rate (₦)', 'Amount (₦)']
-        else if (targetCols === 4) headers = ['Description', 'Qty', 'Rate (₦)', 'Amount (₦)']
-        else headers = Array.from({length: targetCols}, (_,i)=> `Col ${i+1}`)
-        fixes.push('Auto-generated BOQ headers')
-      } else if (targetCols === 3 && rows.some(r => r.some(isNumericCell))) {
-        headers = ['Item', 'Description', 'Amount']
-        fixes.push('Auto-generated 3-col headers')
-      } else {
-        // Generic headers
-        headers = Array.from({length: targetCols}, (_,i)=> `Column ${i+1}`)
-        fixes.push('Auto-generated generic headers')
+      if (!hasHeader) {
+        const hasUnits = rows.some(r => r.some(c => /^(LS|m²|m³|m\b|tonne|No\.?)$/i.test((c||'').trim())))
+        if (hasUnits && targetCols >= 4) {
+          if (targetCols === 5) headers = ['Description', 'Unit', 'Qty', 'Rate (₦)', 'Amount (₦)']
+          else if (targetCols === 4) headers = ['Description', 'Qty', 'Rate (₦)', 'Amount (₦)']
+          else headers = Array.from({length: targetCols}, (_,i)=> `Col ${i+1}`)
+          fixes.push('Auto-generated BOQ headers')
+        } else if (targetCols === 3 && rows.some(r => r.some(isNumericCell))) {
+          headers = ['Item', 'Description', 'Amount']
+          fixes.push('Auto-generated 3-col headers')
+        } else {
+          headers = Array.from({length: targetCols}, (_,i)=> `Column ${i+1}`)
+          fixes.push('Auto-generated generic headers')
+        }
+        hasHeader = true
       }
-      hasHeader = true
+      dataRows = dataRows.map(row => row.map(cleanCell))
+      headers = headers.map(cleanCell)
+      const before = dataRows.length
+      dataRows = dataRows.filter(r => r.some(c => (c||'').trim().length > 0))
+      if (dataRows.length < before) fixes.push(`Removed ${before - dataRows.length} empty rows`)
+      return { headers, rows: dataRows, hasHeader, fixed: fixes, targetCols }
+    } catch (e) {
+      console.warn('fixTableErrors failed', e)
+      return { headers: [], rows: [], fixed: ['Error fixing table: '+e.message] }
     }
-
-    // Step 5: Clean all cells
-    dataRows = dataRows.map(row => row.map(cleanCell))
-    headers = headers.map(cleanCell)
-
-    // Step 6: Remove empty rows
-    const before = dataRows.length
-    dataRows = dataRows.filter(r => r.some(c => c.trim().length > 0))
-    if (dataRows.length < before) fixes.push(`Removed ${before - dataRows.length} empty rows`)
-
-    return { headers, rows: dataRows, hasHeader, fixed: fixes, targetCols }
   }
 
   const blocksToHtml = (blocks) => {
-    let htmlParts = []
-    let totalTables = 0
-    let totalRows = 0
-    let allFixes = []
-
-    for (const block of blocks) {
-      if (block.type === 'text') {
-        // Smart paragraph grouping
-        const paras = block.content.split(/\n\s*\n/).filter(p=>p.trim())
-        for (const para of paras) {
-          const trimmed = para.trim()
-          if (!trimmed) continue
-          // Check if bullet list
-          const lines = trimmed.split('\n').map(l=>l.trim()).filter(Boolean)
-          const bulletLines = lines.filter(l => /^(\s*[-•*]\s+|\s*\d+[\.\)]\s+)/.test(l))
-          if (bulletLines.length >= 2 && bulletLines.length === lines.length) {
-            const isOrdered = /^\s*\d+[\.\)]/.test(bulletLines[0])
-            const tag = isOrdered ? 'ol' : 'ul'
-            let listHtml = `<${tag} style="margin:14px 0 14px 24px; line-height:1.7">`
-            lines.forEach(l => {
-              const content = l.replace(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+)/, '').trim()
-              listHtml += `<li style="margin-bottom:6px">${content}</li>`
-            })
-            listHtml += `</${tag}>`
-            htmlParts.push(listHtml)
-          } else if (trimmed.length < 90 && (trimmed.endsWith(':') || (trimmed.toUpperCase() === trimmed && trimmed.length > 4 && trimmed.length < 80))) {
-            // Heading
-            htmlParts.push(`<p style="margin:16px 0 8px 0"><strong style="font-size:12pt; color:#111">${trimmed}</strong></p>`)
-          } else {
-            // Normal paragraph - group sentences if long block without breaks
-            htmlParts.push(`<p style="margin:10px 0; line-height:1.65; text-align:justify">${trimmed.replace(/\n/g, '<br/>')}</p>`)
+    try {
+      let htmlParts = []
+      let totalTables = 0
+      let totalRows = 0
+      let allFixes = []
+      const safeBlocks = (blocks||[]).slice(0, 100)
+      for (const block of safeBlocks) {
+        if (block.type === 'text') {
+          const paras = (block.content||'').split(/\n\s*\n/).filter(p=>p.trim()).slice(0,50)
+          for (const para of paras) {
+            const trimmed = para.trim().slice(0,2000)
+            if (!trimmed) continue
+            const lines = trimmed.split('\n').map(l=>l.trim()).filter(Boolean).slice(0,20)
+            const bulletLines = lines.filter(l => /^(\s*[-•*]\s+|\s*\d+[\.\)]\s+)/.test(l))
+            if (bulletLines.length >= 2 && bulletLines.length === lines.length) {
+              const isOrdered = /^\s*\d+[\.\)]/.test(bulletLines[0])
+              const tag = isOrdered ? 'ol' : 'ul'
+              let listHtml = `<${tag} style="margin:14px 0 14px 24px; line-height:1.7">`
+              lines.forEach(l => {
+                const content = l.replace(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+)/, '').trim().slice(0,500)
+                listHtml += `<li style="margin-bottom:6px">${content}</li>`
+              })
+              listHtml += `</${tag}>`
+              htmlParts.push(listHtml)
+            } else if (trimmed.length < 90 && (trimmed.endsWith(':') || (trimmed.toUpperCase() === trimmed && trimmed.length > 4 && trimmed.length < 80))) {
+              htmlParts.push(`<p style="margin:16px 0 8px 0"><strong style="font-size:12pt; color:#111">${trimmed}</strong></p>`)
+            } else {
+              htmlParts.push(`<p style="margin:10px 0; line-height:1.65; text-align:justify">${trimmed.replace(/\n/g, '<br/>').slice(0,3000)}</p>`)
+            }
           }
-        }
-      } else if (block.type === 'table') {
-        const fixed = fixTableErrors(block)
-        if (fixed.rows.length === 0) {
-          // Fallback to text
-          htmlParts.push(`<p>${block.rows.map(r=>r.cells.join(' ')).join('<br/>')}</p>`)
-          continue
-        }
-        totalTables++
-        totalRows += fixed.rows.length
-        allFixes.push(...fixed.fixed)
-
-        // Build professional table HTML
-        let tableHtml = `<table class="letter-table" style="width:100%; border-collapse:collapse; margin:18px 0; font-size:10.5pt; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); border:1px solid #e5e5e5">`
-        tableHtml += `<thead><tr style="background:linear-gradient(135deg, #111 0%, #222 100%); color:#fff">`
-        fixed.headers.forEach((h, idx) => {
-          const isNum = /amount|rate|qty|price|total/i.test(h)
-          tableHtml += `<th style="padding:11px 14px; font-weight:700; text-align:${isNum?'right':'left'}; font-size:10pt; letter-spacing:0.3px; border-bottom:2px solid #C9A227; white-space:nowrap">${h}</th>`
-        })
-        tableHtml += `</tr></thead><tbody>`
-
-        fixed.rows.forEach((row, rIdx) => {
-          const isEven = rIdx % 2 === 0
-          const bg = isEven ? '#fff' : '#fafaf8'
-          // Detect if subtotal/total row
-          const isSubtotal = row.join(' ').toLowerCase().includes('total') || row.join(' ').toLowerCase().includes('subtotal')
-          if (isSubtotal) {
-            tableHtml += `<tr style="background:#f0ece3; font-weight:700; border-top:2px solid #C9A227"><td colspan="${fixed.headers.length-1}" style="padding:12px 14px; text-align:right; color:#111">${row.slice(0,-1).join(' ')}</td><td style="padding:12px 14px; text-align:right; color:#111">₦${row[row.length-1].replace(/₦/g,'')}</td></tr>`
-          } else {
-            tableHtml += `<tr style="background:${bg}">`
-            row.forEach((cell, cIdx) => {
-              const header = fixed.headers[cIdx] || ''
-              const isNum = /amount|rate|qty|price|total|₦|\d/.test(header) || isNumericCell(cell) || /^\d/.test(cell)
-              const isUnit = /^(LS|m²|m³|tonne|No)$/i.test(cell.trim())
-              let align = 'left'
-              if (isNum && !isUnit) align = 'right'
-              if (isUnit) align = 'center'
-              const clean = cell.replace(/₦/g,'').trim()
-              const display = /amount|rate|total/i.test(header) && isNumericCell(cell) ? `₦${clean}` : cell
-              tableHtml += `<td style="padding:10px 14px; border-bottom:1px solid #eee; text-align:${align}; vertical-align:top; ${isNum?'font-variant-numeric:tabular-nums; font-family:monospace;':''}">${display}</td>`
-            })
-            tableHtml += `</tr>`
+        } else if (block.type === 'table') {
+          const fixed = fixTableErrors(block)
+          if (fixed.rows.length === 0) {
+            htmlParts.push(`<p>${(block.rows||[]).map(r=>(r.cells||[]).join(' ')).join('<br/>').slice(0,1000)}</p>`)
+            continue
           }
-        })
-        tableHtml += `</tbody></table>`
-        htmlParts.push(tableHtml)
+          totalTables++
+          totalRows += fixed.rows.length
+          allFixes.push(...(fixed.fixed||[]))
+          let tableHtml = `<table class="letter-table" style="width:100%; border-collapse:collapse; margin:18px 0; font-size:10.5pt; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); border:1px solid #e5e5e5">`
+          tableHtml += `<thead><tr style="background:linear-gradient(135deg, #111 0%, #222 100%); color:#fff">`
+          fixed.headers.forEach((h) => {
+            const isNum = /amount|rate|qty|price|total/i.test(h)
+            tableHtml += `<th style="padding:11px 14px; font-weight:700; text-align:${isNum?'right':'left'}; font-size:10pt; letter-spacing:0.3px; border-bottom:2px solid #C9A227; white-space:nowrap">${(h||'').slice(0,50)}</th>`
+          })
+          tableHtml += `</tr></thead><tbody>`
+          fixed.rows.slice(0,100).forEach((row, rIdx) => {
+            const isEven = rIdx % 2 === 0
+            const bg = isEven ? '#fff' : '#fafaf8'
+            const isSubtotal = row.join(' ').toLowerCase().includes('total') || row.join(' ').toLowerCase().includes('subtotal')
+            if (isSubtotal) {
+              tableHtml += `<tr style="background:#f0ece3; font-weight:700; border-top:2px solid #C9A227"><td colspan="${fixed.headers.length-1}" style="padding:12px 14px; text-align:right; color:#111">${row.slice(0,-1).join(' ').slice(0,200)}</td><td style="padding:12px 14px; text-align:right; color:#111">₦${(row[row.length-1]||'').replace(/₦/g,'').slice(0,20)}</td></tr>`
+            } else {
+              tableHtml += `<tr style="background:${bg}">`
+              row.forEach((cell, cIdx) => {
+                const header = fixed.headers[cIdx] || ''
+                const isNum = /amount|rate|qty|price|total|₦|\d/.test(header) || isNumericCell(cell) || /^\d/.test(cell||'')
+                const isUnit = /^(LS|m²|m³|tonne|No)$/i.test((cell||'').trim())
+                let align = 'left'
+                if (isNum && !isUnit) align = 'right'
+                if (isUnit) align = 'center'
+                const display = /amount|rate|total/i.test(header) && isNumericCell(cell) ? `₦${(cell||'').replace(/₦/g,'').trim().slice(0,30)}` : (cell||'').slice(0,200)
+                tableHtml += `<td style="padding:10px 14px; border-bottom:1px solid #eee; text-align:${align}; vertical-align:top; ${isNum?'font-variant-numeric:tabular-nums;':''}">${display}</td>`
+              })
+              tableHtml += `</tr>`
+            }
+          })
+          tableHtml += `</tbody></table>`
+          htmlParts.push(tableHtml)
+        }
       }
+      return { html: htmlParts.join('\n').slice(0,50000), stats: { tables: totalTables, rows: totalRows, fixes: allFixes } }
+    } catch (e) {
+      console.warn('blocksToHtml failed', e)
+      return { html: `<p>Error formatting tables: ${e.message}</p>`, stats: { tables: 0, rows: 0, fixes: [e.message] } }
     }
-
-    return { html: htmlParts.join('\n'), stats: { tables: totalTables, rows: totalRows, fixes: allFixes } }
-  }
-
-  const detectTablesInText = (text) => {
-    const blocks = detectTableBlocks(text)
-    const hasTable = blocks.some(b => b.type === 'table')
-    return hasTable
   }
 
   const smartImproveText = (raw) => {
-    let text = raw.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').replace(/ +\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
-    return text
+    try {
+      let text = (raw||'').replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').replace(/ +\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+      return text.slice(0, 80000)
+    } catch { return (raw||'').slice(0,80000) }
   }
 
-  // BOQ Parser - enhanced
   const parseBOQ = (text) => {
-    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0)
-    const sections = []
-    let currentSection = null
-    let grandTotal = null
-    let recipient = null
-
-    const recipientMatch = text.match(/(?:Prepared For|Client|For)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)/i)
-    if (recipientMatch) recipient = recipientMatch[1]
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-      const sectionMatch = line.match(/^\s*(\d+)\s*[—\-–\.]\s*(.+?)(?:\s+Total)?$/i)
-      const sectionAltMatch = line.match(/^(?:SECTION\s*)?(\d+)\s*[-—]\s*(.+)/i)
-      if ((sectionMatch && sectionMatch[2].length > 5 && sectionMatch[2].length < 80) || (sectionAltMatch && sectionAltMatch[2].length > 5)) {
-        const num = sectionMatch ? sectionMatch[1] : sectionAltMatch[1]
-        const title = (sectionMatch ? sectionMatch[2] : sectionAltMatch[2]).replace(/Total$/i, '').trim()
-        if (!/^\d+[\d,\.]*$/.test(title) && !/^(LS|m³|m²|tonne|No)/i.test(title)) {
-          if (currentSection) sections.push(currentSection)
-          currentSection = { number: num, title, rows: [], subtotal: null }
+    try {
+      const lines = (text||'').split('\n').map(l => l.trim()).filter(l => l.length > 0).slice(0,1000)
+      const sections = []
+      let currentSection = null
+      let grandTotal = null
+      let recipient = null
+      const recipientMatch = (text||'').match(/(?:Prepared For|Client|For)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)/i)
+      if (recipientMatch) recipient = recipientMatch[1]
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]||''
+        const sectionMatch = line.match(/^\s*(\d+)\s*[—\-–\.]\s*(.+?)(?:\s+Total)?$/i)
+        const sectionAltMatch = line.match(/^(?:SECTION\s*)?(\d+)\s*[-—]\s*(.+)/i)
+        if ((sectionMatch && sectionMatch[2].length > 5 && sectionMatch[2].length < 80) || (sectionAltMatch && sectionAltMatch[2].length > 5)) {
+          const num = sectionMatch ? sectionMatch[1] : sectionAltMatch[1]
+          const title = (sectionMatch ? sectionMatch[2] : sectionAltMatch[2]).replace(/Total$/i, '').trim()
+          if (!/^\d+[\d,\.]*$/.test(title) && !/^(LS|m³|m²|tonne|No)/i.test(title)) {
+            if (currentSection) sections.push(currentSection)
+            currentSection = { number: num, title: title.slice(0,100), rows: [], subtotal: null }
+            continue
+          }
+        }
+        const rowRegex = /^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?|Nos?\.?)\s+([0-9\.\-—]+)\s+([0-9,\.]+)\s+([0-9,\.]+)$/i
+        const rowMatch = line.match(rowRegex)
+        if (rowMatch && currentSection) {
+          const [, desc, unit, qty, rate, amount] = rowMatch
+          if (desc.length > 3 && !/^\d+$/.test(desc.trim())) {
+            currentSection.rows.push({ description: desc.trim().slice(0,300), unit: unit.trim(), qty: qty.trim(), rate: rate.trim(), amount: amount.trim() })
+            continue
+          }
+        }
+        const subtotalMatch = line.match(/(.+?)\s+Total\s+₦?([0-9,\.]+)/i)
+        if (subtotalMatch && currentSection && /total/i.test(line)) {
+          if (line.toLowerCase().includes('grand') || line.toLowerCase().includes('provisional')) {
+            grandTotal = subtotalMatch[2] || line.match(/₦?([0-9,\.]+)/)?.[1]
+          } else {
+            currentSection.subtotal = subtotalMatch[2] || line.match(/₦?([0-9,\.]+)/)?.[1]
+          }
           continue
         }
+        const grandMatch = line.match(/Grand\s+Total.*?₦?([0-9,\.]+)/i)
+        if (grandMatch) grandTotal = grandMatch[1]
       }
-      const rowRegex = /^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?|Nos?\.?)\s+([0-9\.\-—]+)\s+([0-9,\.]+)\s+([0-9,\.]+)$/i
-      const rowMatch = line.match(rowRegex)
-      if (rowMatch && currentSection) {
-        const [, desc, unit, qty, rate, amount] = rowMatch
-        if (desc.length > 3 && !/^\d+$/.test(desc.trim())) {
-          currentSection.rows.push({ description: desc.trim(), unit: unit.trim(), qty: qty.trim(), rate: rate.trim(), amount: amount.trim() })
-          continue
+      if (currentSection) sections.push(currentSection)
+      if (sections.length === 0) {
+        const allRows = []
+        for (const line of lines) {
+          const m = line.match(/^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?)\s+([0-9\.\-—]+)\s+([0-9,\.]+)\s+([0-9,\.]+)$/i)
+          if (m) allRows.push({ description: m[1].trim().slice(0,300), unit: m[2], qty: m[3], rate: m[4], amount: m[5] })
         }
+        if (allRows.length >= 3) sections.push({ number: '1', title: 'Bill Items', rows: allRows, subtotal: null })
       }
-      const subtotalMatch = line.match(/(.+?)\s+Total\s+₦?([0-9,\.]+)/i)
-      if (subtotalMatch && currentSection && /total/i.test(line)) {
-        if (line.toLowerCase().includes('grand') || line.toLowerCase().includes('provisional')) {
-          grandTotal = subtotalMatch[2] || line.match(/₦?([0-9,\.]+)/)?.[1]
-        } else {
-          currentSection.subtotal = subtotalMatch[2] || line.match(/₦?([0-9,\.]+)/)?.[1]
-        }
-        continue
-      }
-      const grandMatch = line.match(/Grand\s+Total.*?₦?([0-9,\.]+)/i)
-      if (grandMatch) grandTotal = grandMatch[1]
+      return { sections, grandTotal, recipient, isBOQ: sections.length > 0 && sections.some(s => s.rows.length >= 2) }
+    } catch (e) {
+      console.warn('parseBOQ failed', e)
+      return { sections: [], grandTotal: null, recipient: null, isBOQ: false }
     }
-    if (currentSection) sections.push(currentSection)
-    if (sections.length === 0) {
-      const allRows = []
-      for (const line of lines) {
-        const m = line.match(/^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?)\s+([0-9\.\-—]+)\s+([0-9,\.]+)\s+([0-9,\.]+)$/i)
-        if (m) allRows.push({ description: m[1].trim(), unit: m[2], qty: m[3], rate: m[4], amount: m[5] })
-      }
-      if (allRows.length >= 3) sections.push({ number: '1', title: 'Bill Items', rows: allRows, subtotal: null })
-    }
-    return { sections, grandTotal, recipient, isBOQ: sections.length > 0 && sections.some(s => s.rows.length >= 2) }
   }
 
   const formatBOQToHtml = (boq) => {
-    const { sections, grandTotal, recipient } = boq
-    let html = `
-<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bill of Quantity - Q25</title>
-<style>
-  @page { size: A4; margin: 20mm; }
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family: 'Nunito Sans', sans-serif; color:#2c2c2c; line-height:1.5; background:#f5f5f5; padding:20px; }
-  .document { max-width:900px; margin:0 auto; background:#fff; box-shadow:0 2px 20px rgba(0,0,0,0.1); }
-  .header { background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 50%, #000 100%); color:#fff; padding:40px 50px; display:flex; justify-content:space-between; align-items:center; border-bottom:4px solid #C9A227; }
-  .company-name { font-size:32px; font-weight:800; letter-spacing:4px; color:#D4AF37; }
-  .company-tagline { font-size:11px; letter-spacing:2px; color:#b0b0b0; margin-top:4px; text-transform:uppercase; }
-  .contact-info { text-align:right; font-size:12px; line-height:1.8; color:#ccc; }
-  .contact-info a { color:#D4AF37; text-decoration:none; }
-  .doc-title-bar { background: linear-gradient(135deg, #C9A227, #D4AF37); color:#000; text-align:center; padding:18px 50px; font-size:16px; font-weight:800; letter-spacing:3px; text-transform:uppercase; }
-  .body { padding:40px 50px; }
-  .recipient { margin-bottom:30px; font-size:14px; line-height:1.8; }
-  .recipient .label { font-weight:700; color:#666; font-size:11px; text-transform:uppercase; letter-spacing:1px; }
-  .recipient .name { font-size:18px; font-weight:800; color:#111; }
-  .subtitle { font-size:13px; color:#666; margin-bottom:30px; padding-bottom:20px; border-bottom:2px solid #C9A227; }
-  .subtitle strong { color:#111; }
-  .section { margin-bottom:30px; }
-  .section-header { background:#111; color:#D4AF37; padding:12px 20px; font-size:13px; font-weight:800; letter-spacing:2px; text-transform:uppercase; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  thead th { background:#222; color:#fff; padding:10px 15px; text-align:left; font-size:11px; font-weight:700; letter-spacing:1px; text-transform:uppercase; border-bottom:2px solid #C9A227; }
-  thead th:nth-child(2), thead th:nth-child(3), thead th:nth-child(4), thead th:nth-child(5) { text-align:right; }
-  tbody td { padding:10px 15px; border-bottom:1px solid #e8e8e8; vertical-align:top; }
-  tbody tr:nth-child(even) { background:#fafaf8; }
-  tbody tr:hover { background:rgba(201,162,39,0.06); }
-  tbody td:nth-child(2) { text-align:center; color:#888; font-size:12px; }
-  tbody td:nth-child(3), tbody td:nth-child(4), tbody td:nth-child(5) { text-align:right; font-family:monospace; white-space:nowrap; }
-  tbody td:nth-child(5) { font-weight:700; }
-  .subtotal-row td { background:#f0ece3; font-weight:800; border-top:2px solid #C9A227; padding:12px 15px; color:#111; }
-  .subtotal-row td:last-child { font-size:14px; }
-  .grand-total-bar { background: linear-gradient(135deg, #111, #000); color:#fff; display:flex; justify-content:space-between; align-items:center; padding:20px 50px; border-top:4px solid #C9A227; }
-  .grand-total-label { font-size:14px; font-weight:800; letter-spacing:3px; text-transform:uppercase; color:#D4AF37; }
-  .grand-total-amount { font-size:28px; font-weight:800; color:#fff; }
-  .notes-section { padding:30px 50px; border-top:1px solid #e0e0e0; }
-  .notes-title { font-size:12px; font-weight:800; letter-spacing:2px; text-transform:uppercase; color:#111; margin-bottom:10px; }
-  .notes-content { font-size:12px; color:#666; line-height:1.8; padding-left:15px; }
-  .footer { background:#f8f8f8; padding:30px 50px; display:flex; justify-content:space-between; align-items:flex-end; border-top:1px solid #e0e0e0; }
-  .signatory .name { font-size:18px; font-weight:800; color:#111; margin-top:20px; }
-  .signatory .title { font-size:12px; color:#888; letter-spacing:1px; text-transform:uppercase; }
-  .footer-brand { text-align:right; font-size:11px; color:#aaa; }
-</style></head><body><div class="document">
-<div class="header"><div><div class="company-name">Q25 LUXURY CONSTRUX</div><div class="company-tagline">Building Excellence • Crafting Luxury</div></div><div class="contact-info">La 17, Asgard Drive, DME Estate<br/>Lokogoma, FCT – Abuja<br/><a href="mailto:q25luxuryconstrux@gmail.com">q25luxuryconstrux@gmail.com</a><br/>+234 810 370 6865</div></div>
-<div class="doc-title-bar">Provisional Bill of Quantity</div>
-<div class="body">
-<div class="recipient"><div class="label">Prepared For</div><div class="name">${recipient || 'Client'}</div></div>
-<div class="subtitle"><strong>Project:</strong> Luxury Duplex &nbsp;•&nbsp; <strong>Construction Area:</strong> 233 m² &nbsp;•&nbsp; <strong>Location:</strong> Abuja, FCT &nbsp;•&nbsp; <strong>Date:</strong> ${new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}<br/><strong>Ref:</strong> Q25/${new Date().getFullYear()}/001</div>
-`
-    sections.forEach(sec => {
-      if (sec.rows.length === 0) return
-      html += `<div class="section"><div class="section-header">${sec.number} — ${sec.title}</div><table><thead><tr><th style="width:44%">Description</th><th style="width:10%">Unit</th><th style="width:10%">Qty</th><th style="width:18%">Rate (₦)</th><th style="width:18%">Amount (₦)</th></tr></thead><tbody>`
-      sec.rows.forEach(row => {
-        html += `<tr><td class="item-desc">${row.description}</td><td>${row.unit}</td><td>${row.qty}</td><td>${row.rate}</td><td>${row.amount}</td></tr>`
+    try {
+      const { sections, grandTotal, recipient } = boq
+      let html = `<div style="font-family: Nunito Sans, sans-serif; background:#fff; padding:20px; border-radius:12px">
+      <div style="background:linear-gradient(135deg,#0a0a0a,#1a1a1a); color:#fff; padding:24px; border-bottom:4px solid #C9A227; border-radius:12px 12px 0 0"><div style="font-size:20px; font-weight:800; color:#D4AF37; letter-spacing:2px">Q25 LUXURY CONSTRUX</div><div style="font-size:10px; color:#aaa; margin-top:4px">Building Excellence</div></div>
+      <div style="background:linear-gradient(135deg,#C9A227,#D4AF37); color:#000; text-align:center; padding:12px; font-weight:800; letter-spacing:2px">Provisional Bill of Quantity</div>
+      <div style="padding:20px"><div style="margin-bottom:12px"><span style="font-weight:700; font-size:11px; color:#666">PREPARED FOR</span><br/><span style="font-size:16px; font-weight:800">${recipient||'Client'}</span></div>`
+      sections.slice(0,20).forEach(sec => {
+        if (sec.rows.length === 0) return
+        html += `<div style="margin-bottom:20px"><div style="background:#111; color:#D4AF37; padding:8px 12px; font-size:11px; font-weight:800">${sec.number} — ${sec.title}</div><table style="width:100%; border-collapse:collapse; font-size:11px"><thead><tr><th style="background:#222; color:#fff; padding:8px; text-align:left; border-bottom:2px solid #C9A227">Description</th><th style="background:#222; color:#fff; padding:8px; text-align:center">Unit</th><th style="background:#222; color:#fff; padding:8px; text-align:right">Qty</th><th style="background:#222; color:#fff; padding:8px; text-align:right">Rate</th><th style="background:#222; color:#fff; padding:8px; text-align:right">Amount</th></tr></thead><tbody>`
+        sec.rows.slice(0,100).forEach(row => {
+          html += `<tr><td style="padding:6px 8px; border-bottom:1px solid #eee">${row.description}</td><td style="padding:6px 8px; text-align:center; color:#888">${row.unit}</td><td style="padding:6px 8px; text-align:right; font-family:monospace">${row.qty}</td><td style="padding:6px 8px; text-align:right; font-family:monospace">${row.rate}</td><td style="padding:6px 8px; text-align:right; font-weight:700">₦${row.amount}</td></tr>`
+        })
+        if (sec.subtotal) html += `<tr style="background:#f0ece3; font-weight:800"><td colspan="4" style="padding:8px; text-align:right">${sec.title} Total</td><td style="padding:8px; text-align:right">₦${sec.subtotal}</td></tr>`
+        html += `</tbody></table></div>`
       })
-      if (sec.subtotal) html += `<tr class="subtotal-row"><td colspan="4">${sec.title} Total</td><td>₦${sec.subtotal}</td></tr>`
-      html += `</tbody></table></div>`
-    })
-    if (grandTotal) html += `</div><div class="grand-total-bar"><div class="grand-total-label">Grand Total (Excl. Contingency)</div><div class="grand-total-amount">₦${grandTotal}</div></div>`
-    else html += `</div>`
-    html += `
-<div class="notes-section"><div class="notes-title">Important Notes</div><ol class="notes-content"><li>This Bill of Quantity is calculated based on site inspection and landscape measurement, using current Abuja construction prices.</li><li>Fencing, gate house, and external works are <strong>not included</strong>.</li><li>Auto-formatted by Q25 App — tables auto-detected and errors fixed.</li></ol></div>
-<div class="footer"><div class="signatory"><div style="font-size:12px; color:#888;">Prepared & Approved By:</div><div class="name">Olalekan Sanusi</div><div class="title">Chief Executive Officer</div></div><div class="footer-brand">Q25 LUXURY CONSTRUX<br/><span style="color:#C9A227;">Building Excellence</span></div></div>
-</div></body></html>`
-    return html
+      if (grandTotal) html += `<div style="background:linear-gradient(135deg,#111,#000); color:#fff; display:flex; justify-content:space-between; padding:14px 20px; border-top:4px solid #C9A227; margin-top:10px"><span style="color:#D4AF37; font-weight:800; letter-spacing:2px">GRAND TOTAL</span><span style="font-size:18px; font-weight:800">₦${grandTotal}</span></div>`
+      html += `</div></div>`
+      return html
+    } catch (e) {
+      console.warn('formatBOQ failed', e)
+      return `<p>Error formatting BOQ: ${e.message}</p>`
+    }
   }
 
   const textToHtmlWithTables = (rawText) => {
-    const text = smartImproveText(rawText)
-    const boq = parseBOQ(text)
-    if (boq.isBOQ && boq.sections.length > 0) {
-      setIsBOQ(true)
-      setBoqData(boq)
-      const stats = { tables: boq.sections.length, rows: boq.sections.reduce((a,s)=>a+s.rows.length,0), fixes: ['BOQ auto-detected','Sections grouped','Subtotals calculated'] }
-      setTableStats(stats)
-      return formatBOQToHtml(boq)
-    }
-
-    // SMART generic table detection
-    const blocks = detectTableBlocks(text)
-    const hasTable = blocks.some(b => b.type === 'table')
-    setHasTables(hasTable)
-    setIsBOQ(false)
-
-    if (hasTable) {
-      const result = blocksToHtml(blocks)
-      setTableStats(result.stats)
-      return result.html
-    }
-
-    // No tables - smart paragraphs, bullets, headings
-    const lines = text.split('\n')
-    let result = []
-    let currentPara = []
-    let inList = false
-    let listBuffer = []
-    let listType = 'ul'
-
-    const flushList = () => {
-      if (listBuffer.length === 0) return ''
-      const tag = listType
-      let out = `<${tag} style="margin:14px 0 14px 24px; line-height:1.7">`
-      listBuffer.forEach(item => { out += `<li style="margin-bottom:6px">${item}</li>` })
-      out += `</${tag}>`
-      listBuffer = []
-      inList = false
-      return out
-    }
-    const flushPara = () => {
-      if (currentPara.length) {
-        const paraText = currentPara.join(' ').trim()
-        if (paraText) {
-          if (paraText.length < 90 && (paraText.endsWith(':') || (paraText.toUpperCase() === paraText && paraText.length > 3 && paraText.length < 80))) {
-            result.push(`<p style="margin:16px 0 8px 0"><strong style="font-size:12pt">${paraText}</strong></p>`)
+    try {
+      const text = smartImproveText(rawText)
+      const boq = parseBOQ(text)
+      if (boq.isBOQ && boq.sections.length > 0) {
+        setIsBOQ(true)
+        setBoqData(boq)
+        const stats = { tables: boq.sections.length, rows: boq.sections.reduce((a,s)=>a+s.rows.length,0), fixes: ['BOQ auto-detected','Sections grouped'] }
+        setTableStats(stats)
+        return formatBOQToHtml(boq)
+      }
+      const blocks = detectTableBlocks(text)
+      const hasTable = blocks.some(b => b.type === 'table')
+      setHasTables(hasTable)
+      setIsBOQ(false)
+      if (hasTable) {
+        const result = blocksToHtml(blocks)
+        setTableStats(result.stats)
+        return result.html
+      }
+      const lines = text.split('\n').slice(0,1000)
+      let result = []
+      let currentPara = []
+      let inList = false
+      let listBuffer = []
+      let listType = 'ul'
+      const flushList = () => {
+        if (listBuffer.length === 0) return ''
+        const tag = listType
+        let out = `<${tag} style="margin:14px 0 14px 24px; line-height:1.7">`
+        listBuffer.forEach(item => { out += `<li style="margin-bottom:6px">${(item||'').slice(0,500)}</li>` })
+        out += `</${tag}>`
+        listBuffer = []
+        inList = false
+        return out
+      }
+      const flushPara = () => {
+        if (currentPara.length) {
+          const paraText = currentPara.join(' ').trim().slice(0,2000)
+          if (paraText) {
+            if (paraText.length < 90 && (paraText.endsWith(':') || (paraText.toUpperCase() === paraText && paraText.length > 3 && paraText.length < 80))) {
+              result.push(`<p style="margin:16px 0 8px 0"><strong style="font-size:12pt">${paraText}</strong></p>`)
+            } else {
+              result.push(`<p style="margin:10px 0; line-height:1.65; text-align:justify">${paraText}</p>`)
+            }
+          }
+          currentPara = []
+        }
+      }
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]||''
+        const trimmed = line.trim().slice(0,1000)
+        if (!trimmed) { flushPara(); if (inList) result.push(flushList()); continue }
+        const bulletMatch = trimmed.match(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+|\s*[a-zA-Z][\.\)]\s+)/)
+        if (bulletMatch) {
+          flushPara()
+          const content = trimmed.replace(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+|\s*[a-zA-Z][\.\)]\s+)/, '').trim().slice(0,500)
+          if (/^\s*\d+[\.\)]/.test(trimmed)) listType = 'ol'; else listType = 'ul'
+          if (!inList) inList = true
+          listBuffer.push(content)
+          continue
+        }
+        if (inList) {
+          if (listBuffer.length && trimmed.length > 0 && listBuffer[listBuffer.length-1].length < 120) {
+            listBuffer[listBuffer.length-1] += ' ' + trimmed
+            continue
           } else {
-            result.push(`<p style="margin:10px 0; line-height:1.65; text-align:justify">${paraText}</p>`)
+            result.push(flushList())
           }
         }
-        currentPara = []
+        currentPara.push(trimmed)
+        if (trimmed.endsWith('.') && currentPara.join(' ').length > 280) flushPara()
       }
+      if (inList && listBuffer.length) result.push(flushList())
+      flushPara()
+      setTableStats({ tables: 0, rows: 0, fixes: ['No tables - paragraphs & lists'] })
+      return result.join('\n').slice(0,50000)
+    } catch (e) {
+      console.warn('textToHtmlWithTables failed', e)
+      setErrorMsg('Formatting failed: ' + e.message)
+      return `<p>${(rawText||'').slice(0,5000).replace(/\n/g,'<br/>')}</p>`
     }
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-      const trimmed = line.trim()
-      if (!trimmed) { flushPara(); if (inList) result.push(flushList()); continue }
-      const bulletMatch = trimmed.match(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+|\s*[a-zA-Z][\.\)]\s+)/)
-      if (bulletMatch) {
-        flushPara()
-        const content = trimmed.replace(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+|\s*[a-zA-Z][\.\)]\s+)/, '').trim()
-        if (/^\s*\d+[\.\)]/.test(trimmed)) listType = 'ol'; else listType = 'ul'
-        if (!inList) inList = true
-        listBuffer.push(content)
-        continue
-      }
-      if (inList) {
-        if (listBuffer.length && trimmed.length > 0 && listBuffer[listBuffer.length-1].length < 120) {
-          listBuffer[listBuffer.length-1] += ' ' + trimmed
-          continue
-        } else {
-          result.push(flushList())
-        }
-      }
-      currentPara.push(trimmed)
-      if (trimmed.endsWith('.') && currentPara.join(' ').length > 280) flushPara()
-    }
-    if (inList && listBuffer.length) result.push(flushList())
-    flushPara()
-    setTableStats({ tables: 0, rows: 0, fixes: ['No tables - formatted as paragraphs & lists'] })
-    return result.join('\n')
   }
 
   const formatToHtml = (text, htmlWithTables = null) => {
-    if (htmlWithTables && htmlWithTables.includes('<table')) {
-      let cleaned = htmlWithTables.replace(/<table>/g, '<table class="letter-table">').replace(/<table[^>]*>/g, '<table class="letter-table">')
-      return cleaned
+    try {
+      if (htmlWithTables && htmlWithTables.includes('<table')) {
+        let cleaned = htmlWithTables.replace(/<table>/g, '<table class="letter-table">').replace(/<table[^>]*>/g, '<table class="letter-table">')
+        return cleaned.slice(0,50000)
+      }
+      return textToHtmlWithTables(text)
+    } catch (e) {
+      console.warn('formatToHtml failed', e)
+      return textToHtmlWithTables(text)
     }
-    return textToHtmlWithTables(text)
   }
 
   const extractText = async (file) => {
+    setErrorMsg('')
     setStatus(`Reading ${file.name}...`)
     setProgress(10)
-    const ext = file.name.split('.').pop().toLowerCase()
-    const type = file.type
+    const ext = (file.name.split('.').pop()||'').toLowerCase()
+    const type = file.type || ''
     try {
       if (type === 'text/plain' || ext === 'txt') {
         const txt = await file.text()
         setProgress(100)
         setExtractedHtml('')
-        const blocks = detectTableBlocks(txt)
-        setHasTables(blocks.some(b=>b.type==='table'))
-        const boq = parseBOQ(txt)
-        setIsBOQ(boq.isBOQ)
-        if (boq.isBOQ) setBoqData(boq)
-        return txt
+        try {
+          const blocks = detectTableBlocks(txt)
+          setHasTables(blocks.some(b=>b.type==='table'))
+          const boq = parseBOQ(txt)
+          setIsBOQ(boq.isBOQ)
+          if (boq.isBOQ) setBoqData(boq)
+        } catch {}
+        return txt.slice(0,80000)
       }
       if (type === 'application/pdf' || ext === 'pdf') {
-        setStatus('Extracting PDF with SMART table detection...')
-        const pdfjsLib = await import('pdfjs-dist')
+        setStatus('Extracting PDF — please wait...')
+        let pdfjsLib
+        try {
+          pdfjsLib = await import('pdfjs-dist')
+        } catch (e) {
+          console.warn('pdfjs import failed', e)
+          setErrorMsg('PDF library failed to load: ' + e.message)
+          throw new Error('PDF library failed')
+        }
         try {
           const workerSrc = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
-          pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc.default
+          if (workerSrc && workerSrc.default) pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc.default
         } catch {
-          const version = pdfjsLib.version || '4.10.38'
-          pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
+          try {
+            const version = pdfjsLib.version || '4.10.38'
+            pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
+          } catch {}
         }
-        const buf = await file.arrayBuffer()
+        let buf
+        try { buf = await file.arrayBuffer() } catch (e) { throw new Error('Failed to read PDF file: ' + e.message) }
         let pdf
-        try { pdf = await pdfjsLib.getDocument({ data: buf }).promise }
-        catch (err) {
+        try {
+          pdf = await pdfjsLib.getDocument({ data: buf }).promise
+        } catch (err) {
+          console.warn('getDocument failed', err)
           if (err.message && err.message.includes('API version')) {
-            setStatus('Worker mismatch, retrying...')
-            pdfjsLib.GlobalWorkerOptions.workerSrc = ''
-            pdf = await pdfjsLib.getDocument({ data: buf, disableWorker: true }).promise
-          } else throw err
+            try {
+              setStatus('Worker mismatch, retrying without worker...')
+              pdfjsLib.GlobalWorkerOptions.workerSrc = ''
+              pdf = await pdfjsLib.getDocument({ data: buf, disableWorker: true }).promise
+            } catch (e2) { throw new Error('PDF parse failed: ' + e2.message) }
+          } else {
+            throw new Error('PDF parse failed: ' + err.message)
+          }
         }
         let fullText = ''
         let hasTable = false
-        for (let i = 1; i <= pdf.numPages; i++) {
-          setProgress(Math.round((i / pdf.numPages) * 70))
-          setStatus(`Page ${i}/${pdf.numPages} — detecting tables & fixing errors...`)
-          const page = await pdf.getPage(i)
-          const content = await page.getTextContent()
-          const items = content.items.map(item => ({ str: item.str, x: item.transform[4], y: item.transform[5], width: item.width })).filter(it => it.str.trim())
-          items.sort((a, b) => b.y - a.y || a.x - b.x)
-          let rows = []
-          let currentRow = []
-          let lastY = null
-          const yThreshold = 5
-          for (const item of items) {
-            if (lastY === null || Math.abs(item.y - lastY) < yThreshold) currentRow.push(item)
-            else { if (currentRow.length) rows.push(currentRow); currentRow = [item] }
-            lastY = item.y
+        const maxPages = Math.min(pdf.numPages, 20)
+        for (let i = 1; i <= maxPages; i++) {
+          try {
+            setProgress(Math.round((i / maxPages) * 70))
+            setStatus(`Reading PDF page ${i}/${pdf.numPages}...`)
+            const page = await pdf.getPage(i)
+            const content = await page.getTextContent()
+            const items = (content.items||[]).map(item => {
+              try {
+                return { str: item.str||'', x: item.transform ? item.transform[4] : 0, y: item.transform ? item.transform[5] : 0, width: item.width||0 }
+              } catch { return { str: item.str||'', x: 0, y: 0, width: 0 } }
+            }).filter(it => (it.str||'').trim())
+            items.sort((a, b) => b.y - a.y || a.x - b.x)
+            let rows = []
+            let currentRow = []
+            let lastY = null
+            const yThreshold = 5
+            for (const item of items) {
+              if (lastY === null || Math.abs(item.y - lastY) < yThreshold) currentRow.push(item)
+              else { if (currentRow.length) rows.push(currentRow); currentRow = [item] }
+              lastY = item.y
+            }
+            if (currentRow.length) rows.push(currentRow)
+            let pageText = ''
+            for (const row of rows) {
+              try {
+                row.sort((a, b) => a.x - b.x)
+                if (row.length >= 3) {
+                  const gaps = []
+                  for (let j = 1; j < row.length; j++) gaps.push(row[j].x - (row[j-1].x + row[j-1].width))
+                  const avgGap = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0
+                  if (avgGap > 20) { hasTable = true; pageText += row.map(r => r.str).join('\t') + '\n' }
+                  else pageText += row.map(r => r.str).join(' ') + '\n'
+                } else pageText += row.map(r => r.str).join(' ') + '\n'
+              } catch {}
+            }
+            fullText += pageText + '\n'
+            if (fullText.length > 80000) break
+          } catch (pageErr) {
+            console.warn(`Page ${i} failed`, pageErr)
+            fullText += `\n[Page ${i} extraction failed: ${pageErr.message}]\n`
           }
-          if (currentRow.length) rows.push(currentRow)
-          let pageText = ''
-          for (const row of rows) {
-            row.sort((a, b) => a.x - b.x)
-            if (row.length >= 3) {
-              const gaps = []
-              for (let j = 1; j < row.length; j++) gaps.push(row[j].x - (row[j-1].x + row[j-1].width))
-              const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length
-              if (avgGap > 20) { hasTable = true; pageText += row.map(r => r.str).join('\t') + '\n' }
-              else pageText += row.map(r => r.str).join(' ') + '\n'
-            } else pageText += row.map(r => r.str).join(' ') + '\n'
-          }
-          fullText += pageText + '\n'
         }
         setProgress(90)
-        const blocks = detectTableBlocks(fullText)
-        const boq = parseBOQ(fullText)
-        setIsBOQ(boq.isBOQ)
-        if (boq.isBOQ) { setBoqData(boq); setHasTables(true); setStatus(`BOQ detected! ${boq.sections.length} sections, ${boq.sections.reduce((a,s)=>a+s.rows.length,0)} items — errors fixed`) }
-        else { setHasTables(hasTable || blocks.some(b=>b.type==='table')); setStatus(hasTable ? `Tables detected! ${blocks.filter(b=>b.type==='table').length} tables — auto-fixing...` : `Text detected — no tables`) }
+        try {
+          const blocks = detectTableBlocks(fullText)
+          const boq = parseBOQ(fullText)
+          setIsBOQ(boq.isBOQ)
+          if (boq.isBOQ) { setBoqData(boq); setHasTables(true); setStatus(`BOQ detected! ${boq.sections.length} sections`) }
+          else { setHasTables(hasTable || blocks.some(b=>b.type==='table')); setStatus(hasTable ? `Tables detected!` : `Text extracted`) }
+        } catch {}
         setExtractedHtml('')
         setProgress(100)
-        return fullText
+        return fullText.slice(0,80000)
       }
       if (ext === 'docx' || type.includes('officedocument.wordprocessingml')) {
-        setStatus('Extracting Word doc — detecting tables & fixing...')
-        const mammoth = await import('mammoth')
-        const buf = await file.arrayBuffer()
-        const htmlResult = await mammoth.convertToHtml({ arrayBuffer: buf })
-        const textResult = await mammoth.extractRawText({ arrayBuffer: buf })
-        const hasTable = htmlResult.value.includes('<table')
-        setHasTables(hasTable)
-        setExtractedHtml(hasTable ? htmlResult.value : '')
-        const blocks = detectTableBlocks(textResult.value)
-        const boq = parseBOQ(textResult.value)
-        if (boq.isBOQ) { setIsBOQ(true); setBoqData(boq) }
-        else if (blocks.some(b=>b.type==='table')) setHasTables(true)
-        setProgress(100)
-        return textResult.value
-      }
-      if (ext === 'doc') {
-        setStatus('Legacy .doc - extracting...')
+        setStatus('Extracting Word doc...')
         try {
           const mammoth = await import('mammoth')
           const buf = await file.arrayBuffer()
-          const htmlResult = await mammoth.convertToHtml({ arrayBuffer: buf }).catch(() => ({ value: '' }))
-          const result = await mammoth.extractRawText({ arrayBuffer: buf })
-          setHasTables(htmlResult.value.includes('<table'))
-          setExtractedHtml(htmlResult.value)
-          const boq = parseBOQ(result.value)
-          if (boq.isBOQ) { setIsBOQ(true); setBoqData(boq) }
-          return result.value
-        } catch { return await file.text().catch(() => 'Could not extract .doc') }
+          const htmlResult = await mammoth.convertToHtml({ arrayBuffer: buf }).catch(()=>({value:''}))
+          const textResult = await mammoth.extractRawText({ arrayBuffer: buf }).catch(()=>({value:''}))
+          const hasTable = (htmlResult.value||'').includes('<table')
+          setHasTables(hasTable)
+          setExtractedHtml(hasTable ? htmlResult.value : '')
+          try {
+            const blocks = detectTableBlocks(textResult.value||'')
+            const boq = parseBOQ(textResult.value||'')
+            if (boq.isBOQ) { setIsBOQ(true); setBoqData(boq) }
+            else if (blocks.some(b=>b.type==='table')) setHasTables(true)
+          } catch {}
+          setProgress(100)
+          return (textResult.value||'').slice(0,80000)
+        } catch (e) {
+          console.warn('docx extract failed', e)
+          throw new Error('Word doc extraction failed: ' + e.message)
+        }
       }
       if (type.startsWith('image/') || ['png','jpg','jpeg','webp','bmp'].includes(ext)) {
-        setStatus('OCR scanning — detecting tables & fixing errors...')
+        setStatus('OCR scanning — 10-20s...')
         setProgress(20)
-        const { createWorker } = await import('tesseract.js')
-        const worker = await createWorker('eng', 1, {
-          logger: m => {
-            if (m.status === 'recognizing text') {
-              setProgress(20 + Math.round(m.progress * 60))
-              setStatus(`OCR: ${Math.round(m.progress*100)}% — ${m.status}`)
+        try {
+          const { createWorker } = await import('tesseract.js')
+          const worker = await createWorker('eng', 1, {
+            logger: m => {
+              if (m.status === 'recognizing text') {
+                setProgress(20 + Math.round((m.progress||0) * 60))
+                setStatus(`OCR: ${Math.round((m.progress||0)*100)}%`)
+              }
             }
-          }
-        })
-        const { data } = await worker.recognize(file)
-        await worker.terminate()
-        setProgress(90)
-        const blocks = detectTableBlocks(data.text)
-        const boq = parseBOQ(data.text)
-        setIsBOQ(boq.isBOQ)
-        if (boq.isBOQ) setBoqData(boq)
-        setHasTables(blocks.some(b=>b.type==='table') || boq.isBOQ)
-        setExtractedHtml('')
-        setProgress(100)
-        return data.text
+          })
+          const { data } = await worker.recognize(file)
+          await worker.terminate().catch(()=>{})
+          setProgress(90)
+          try {
+            const blocks = detectTableBlocks(data.text||'')
+            const boq = parseBOQ(data.text||'')
+            setIsBOQ(boq.isBOQ)
+            if (boq.isBOQ) setBoqData(boq)
+            setHasTables(blocks.some(b=>b.type==='table') || boq.isBOQ)
+          } catch {}
+          setProgress(100)
+          return (data.text||'').slice(0,80000)
+        } catch (e) {
+          console.warn('OCR failed', e)
+          throw new Error('OCR failed: ' + e.message)
+        }
       }
-      return await file.text()
+      const txt = await file.text().catch(()=>{ throw new Error('Could not read file as text') })
+      return txt.slice(0,80000)
     } catch (e) {
-      console.error(e)
-      setStatus('Error: ' + e.message)
+      console.error('extractText failed', e)
+      setErrorMsg(e.message)
+      setStatus('Failed: ' + e.message)
       throw e
     }
   }
@@ -904,14 +876,25 @@ function ImportDocModal({ open, onClose, onExtracted }) {
   const handleFiles = async (files) => {
     if (!files || !files.length) return
     const file = files[0]
-    if (file.size > 20 * 1024 * 1024) { setStatus('File too large — max 20MB'); return }
+    if (file.size > 20 * 1024 * 1024) { setStatus('File too large — max 20MB'); setErrorMsg('File too large'); return }
+    setErrorMsg('')
     try {
       const text = await extractText(file)
-      setExtracted(text)
-    } catch (err) { setStatus('Failed: ' + err.message) }
+      if (text && text.trim().length > 0) {
+        setExtracted(text)
+        setStatus(`Extracted ${text.length} chars from ${file.name} ✓`)
+      } else {
+        setStatus('No text extracted')
+        setErrorMsg('No text found in file')
+      }
+    } catch (err) {
+      console.error('handleFiles failed', err)
+      setStatus('Failed: ' + err.message)
+      setErrorMsg(err.message)
+    }
   }
 
-  const handleDrop = (e) => { e.preventDefault(); setDragOver(false); handleFiles(e.dataTransfer.files) }
+  const handleDrop = (e) => { try{ e.preventDefault(); setDragOver(false); handleFiles(e.dataTransfer.files) }catch(err){ setErrorMsg(err.message) } }
 
   if (!open) return null
 
@@ -921,7 +904,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div>
             <h3 style={{ fontSize: 19 }}>Smart Import — Auto-Detects Tables & Fixes Errors</h3>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>Knows difference: text with tables vs text without • BOQ, invoices, estimates</div>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>Robust: won't crash on PDF • Handles errors gracefully</div>
           </div>
           <button className="btn-ghost" onClick={onClose} style={{ padding: '6px 12px' }}>✕ Close</button>
         </div>
@@ -942,12 +925,19 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           <div style={{ fontWeight: 800, fontSize: 15 }}>Drop any document — messy PDF, Word, scan</div>
           <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 6, lineHeight: 1.4 }}>
             <strong>Auto-detects:</strong> tables with errors, BOQ, lists, paragraphs<br/>
-            <strong>Auto-fixes:</strong> misaligned columns, missing headers, merged cells, OCR errors (m², m³), empty rows<br/>
-            .txt, .pdf, .docx, .png, .jpg — max 20MB
+            <strong>Robust:</strong> won't crash app — shows error if fails<br/>
+            .txt, .pdf, .docx, .png, .jpg — max 20MB, max 20 pages
           </div>
           <div style={{ marginTop: 14 }}><span className="btn-gold" style={{ padding: '10px 18px', fontSize: 13 }}>Browse Files</span></div>
-          <input ref={fileRef} type="file" accept=".txt,.pdf,.docx,.doc,.png,.jpg,.jpeg,.webp" style={{ display: 'none' }} onChange={e => handleFiles(e.target.files)} />
+          <input ref={fileRef} type="file" accept=".txt,.pdf,.docx,.doc,.png,.jpg,.jpeg,.webp" style={{ display: 'none' }} onChange={e => { try{ handleFiles(e.target.files) }catch(err){ setErrorMsg(err.message) } }} />
         </div>
+
+        {errorMsg && (
+          <div style={{ marginTop: 16, padding: 12, borderRadius: 12, background: '#fff3f3', border: '1px solid #ffcdd2', fontSize: 13, color: '#b71c1c' }}>
+            <strong>⚠️ Error:</strong> {errorMsg}<br/>
+            <span style={{ fontSize: 11, color: '#666' }}>Try a smaller file, or save PDF as .docx, or take screenshot and upload as image for OCR.</span>
+          </div>
+        )}
 
         {status && (
           <div className="glass" style={{ marginTop: 16, padding: 12, borderRadius: 12, fontSize: 13 }}>
@@ -968,78 +958,69 @@ function ImportDocModal({ open, onClose, onExtracted }) {
                 <span>📊 Tables: {tableStats.tables}</span>
                 <span>📝 Rows: {tableStats.rows}</span>
                 <span>🔧 Fixes: {tableStats.fixes?.length || 0}</span>
-                {tableStats.fixes?.slice(0,3).map((f,i)=><span key={i} style={{ background: 'rgba(201,162,39,0.1)', padding: '2px 6px', borderRadius: 6 }}>{f}</span>)}
               </div>
             )}
           </div>
         )}
 
         {extracted && (
+          <ErrorBoundary onReset={()=>{ setExtracted('') }}>
           <div style={{ marginTop: 18 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
               <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)' }}>
-                {isBOQ ? `BOQ — ${boqData?.sections.length} SECTIONS` : hasTables ? `WITH TABLES — ${tableStats?.tables || 0} TABLES AUTO-FIXED` : 'TEXT ONLY — NO TABLES'} — PROFESSIONAL
+                {isBOQ ? `BOQ — ${boqData?.sections.length} SECTIONS` : hasTables ? `WITH TABLES — ${tableStats?.tables || 0} TABLES` : 'TEXT ONLY'} — PREVIEW
               </label>
               <span style={{ fontSize: 11, color: isBOQ ? '#111' : hasTables ? 'var(--gold)' : '#2e7d32', fontWeight: 800, background: isBOQ ? '#D4AF37' : hasTables ? 'rgba(201,162,39,0.15)' : '#e8f5e9', padding: '2px 8px', borderRadius: 999 }}>
-                {isBOQ ? '📊 BOQ formatted' : hasTables ? '🧠 Tables fixed & styled' : '📝 Paragraphs & bullets'}
+                {isBOQ ? '📊 BOQ formatted' : hasTables ? '🧠 Tables fixed' : '📝 Paragraphs'}
               </span>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
               <div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>MESSY RAW INPUT</div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>MESSY RAW (first 4000 chars)</div>
                 <div className="input-glass" style={{ maxHeight: 280, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 11, lineHeight: 1.4 }}>{extracted.slice(0, 4000)}{extracted.length > 4000 ? '\n... (truncated)' : ''}</div>
               </div>
               <div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PROFESSIONAL FIXED OUTPUT</div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PROFESSIONAL FIXED</div>
                 <div className="glass" style={{ maxHeight: 280, overflowY: 'auto', padding: 8, borderRadius: 12, background: '#fff' }}>
-                  <div style={{ transform: 'scale(0.62)', transformOrigin: 'top left', width: '161%', fontSize: 12 }} dangerouslySetInnerHTML={{ __html: isBOQ && boqData ? formatBOQToHtml(boqData) : formatToHtml(extracted, extractedHtml).slice(0, 12000) }} />
+                  <ErrorBoundary>
+                    <div style={{ transform: 'scale(0.62)', transformOrigin: 'top left', width: '161%', fontSize: 12 }} dangerouslySetInnerHTML={{ __html: (isBOQ && boqData ? formatBOQToHtml(boqData) : formatToHtml(extracted, extractedHtml)).slice(0, 20000) }} />
+                  </ErrorBoundary>
                 </div>
               </div>
             </div>
 
             <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
               <button className="btn-gold" onClick={() => {
-                if (isBOQ && boqData) {
-                  const fullHtml = formatBOQToHtml(boqData)
-                  const blob = new Blob([fullHtml], { type: 'text/html' })
-                  const url = URL.createObjectURL(blob)
-                  window.open(url, '_blank')
-                  const tableHtml = boqData.sections.map(sec => {
-                    let t = `<p><strong>${sec.number} — ${sec.title}</strong></p><table class="letter-table"><thead><tr><th>Description</th><th>Unit</th><th>Qty</th><th>Rate (₦)</th><th>Amount (₦)</th></tr></thead><tbody>`
-                    sec.rows.forEach(r => { t += `<tr><td>${r.description}</td><td>${r.unit}</td><td>${r.qty}</td><td>${r.rate}</td><td>${r.amount}</td></tr>` })
-                    if (sec.subtotal) t += `<tr style="background:#f0ece3; font-weight:800"><td colspan="4">${sec.title} Total</td><td>₦${sec.subtotal}</td></tr>`
-                    t += `</tbody></table>`
-                    return t
-                  }).join('<br/>') + (boqData.grandTotal ? `<div style="background:#111; color:#D4AF37; padding:16px; display:flex; justify-content:space-between; font-weight:800; margin-top:16px"><span>GRAND TOTAL</span><span>₦${boqData.grandTotal}</span></div>` : '')
-                  onExtracted(tableHtml, extracted)
-                } else {
-                  const html = formatToHtml(extracted, extractedHtml)
-                  onExtracted(html, extracted)
+                try {
+                  if (isBOQ && boqData) {
+                    const fullHtml = formatBOQToHtml(boqData)
+                    const blob = new Blob([fullHtml], { type: 'text/html' })
+                    const url = URL.createObjectURL(blob)
+                    window.open(url, '_blank')
+                    const tableHtml = boqData.sections.map(sec => {
+                      let t = `<p><strong>${sec.number} — ${sec.title}</strong></p><table class="letter-table"><thead><tr><th>Description</th><th>Unit</th><th>Qty</th><th>Rate (₦)</th><th>Amount (₦)</th></tr></thead><tbody>`
+                      sec.rows.forEach(r => { t += `<tr><td>${r.description}</td><td>${r.unit}</td><td>${r.qty}</td><td>${r.rate}</td><td>${r.amount}</td></tr>` })
+                      if (sec.subtotal) t += `<tr style="background:#f0ece3; font-weight:800"><td colspan="4">${sec.title} Total</td><td>₦${sec.subtotal}</td></tr>`
+                      t += `</tbody></table>`
+                      return t
+                    }).join('<br/>') + (boqData.grandTotal ? `<div style="background:#111; color:#D4AF37; padding:16px; display:flex; justify-content:space-between; font-weight:800; margin-top:16px"><span>GRAND TOTAL</span><span>₦${boqData.grandTotal}</span></div>` : '')
+                    onExtracted(tableHtml, extracted)
+                  } else {
+                    const html = formatToHtml(extracted, extractedHtml)
+                    onExtracted(html, extracted)
+                  }
+                  onClose()
+                } catch (e) {
+                  setErrorMsg('Failed to apply: ' + e.message)
+                  console.error(e)
                 }
-                onClose()
               }}>✨ {isBOQ ? 'Format BOQ & Put on Letterhead' : hasTables ? 'Fix Tables & Put on Letterhead' : 'Format Text & Put on Letterhead'}</button>
               
-              {isBOQ && (
-                <button className="btn-ghost" style={{ fontSize: 12, background: '#111', color: '#D4AF37' }} onClick={() => {
-                  const fullHtml = formatBOQToHtml(boqData)
-                  const blob = new Blob([fullHtml], { type: 'text/html' })
-                  const url = URL.createObjectURL(blob)
-                  const a = document.createElement('a')
-                  a.href = url
-                  a.download = `BOQ_Formatted_${new Date().toISOString().slice(0,10)}.html`
-                  a.click()
-                }}>⬇ Download HTML</button>
-              )}
-
-              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => { setExtracted(''); setExtractedHtml(''); setStatus(''); setProgress(0); setHasTables(false); setIsBOQ(false); setBoqData(null); setTableStats(null) }}>Clear</button>
-            </div>
-
-            <div className="glass" style={{ marginTop: 14, padding: 12, borderRadius: 12, fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-              <strong>🧠 Smart Engine:</strong> {isBOQ ? `BOQ detected — sections, tables, subtotals auto-fixed.` : hasTables ? `Detected ${tableStats?.tables||0} tables, ${tableStats?.rows||0} rows. Fixes: ${tableStats?.fixes?.join(', ')||'none'}. Knows difference between text with tables (creates professional gold/black tables) and text without (paragraphs + bullets).` : 'No tables detected — formatted as professional paragraphs, headings, bullet/numbered lists.'}
-              <br/>Date on right with professional space. No text cut — moves to next page if needed.
+              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => { setExtracted(''); setExtractedHtml(''); setStatus(''); setProgress(0); setHasTables(false); setIsBOQ(false); setBoqData(null); setTableStats(null); setErrorMsg('') }}>Clear</button>
             </div>
           </div>
+          </ErrorBoundary>
         )}
       </div>
     </div>
@@ -1047,232 +1028,244 @@ function ImportDocModal({ open, onClose, onExtracted }) {
 }
 
 
-// ---------- Preview ----------
+// ---------- Preview - ROBUST (won't crash on large PDFs) ----------
 function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true }) {
   const containerRef = useRef(null)
   const contentMeasureRef = useRef(null)
   const [pagesData, setPagesData] = useState([[]])
-  const [totalPages, setTotalPages] = useState(1)
+  const [error, setError] = useState(null)
 
   const blocks = useMemo(() => {
-    const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
-    const ref = letter.reference_no || ''
+    try {
+      const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
+      const ref = (letter.reference_no || '').slice(0, 50)
 
-    const blockList = []
+      const blockList = []
 
-    // Ref & Date - with professional spacing
-    blockList.push({
-      id: 'refdate',
-      type: 'refdate',
-      html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-top:18px; margin-bottom:22px; padding-top:8px; display:flex; justify-content:space-between; font-size:10.5pt; align-items:flex-start; line-height:1.4">
+      blockList.push({
+        id: 'refdate',
+        type: 'refdate',
+        html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-top:18px; margin-bottom:22px; padding-top:8px; display:flex; justify-content:space-between; font-size:10.5pt; align-items:flex-start; line-height:1.4">
           <div style="font-weight:700; letter-spacing:0.2px">Ref: ${ref}</div>
           <div style="text-align:right; font-weight:500; color:#222">${dateStr}</div>
         </div>`,
-      keepTogether: true
-    })
-
-    // Recipient
-    if (letter.recipient_name || letter.recipient_title || letter.recipient_address) {
-      let html = `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-bottom:20px; line-height:1.5">`
-      if (letter.recipient_name) html += `<div style="font-weight:700; font-size:11.5pt">${letter.recipient_name}</div>`
-      if (letter.recipient_title) html += `<div style="font-size:10.5pt; color:#222">${letter.recipient_title}</div>`
-      if (letter.recipient_address) html += `<div style="white-space:pre-line; font-size:10.5pt; margin-top:2px">${letter.recipient_address}</div>`
-      html += `</div>`
-      blockList.push({ id: 'recipient', type: 'recipient', html, keepTogether: true })
-    }
-
-    // Subject
-    if (letter.subject) {
-      blockList.push({
-        id: 'subject',
-        type: 'subject',
-        html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:16px 0 14px 0; font-size:11pt"><span style="font-weight:700">Subject: </span><span style="font-weight:700; text-decoration:underline; text-underline-offset:3px">${letter.subject}</span></div>`,
         keepTogether: true
       })
-    }
 
-    // Salutation
-    if (letter.salutation) {
-      blockList.push({
-        id: 'salutation',
-        type: 'salutation',
-        html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:12px 0 16px 0; font-size:11.5pt">${letter.salutation}</div>`,
-        keepTogether: true
-      })
-    }
+      if (letter.recipient_name || letter.recipient_title || letter.recipient_address) {
+        let html = `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-bottom:20px; line-height:1.5">`
+        if (letter.recipient_name) html += `<div style="font-weight:700; font-size:11.5pt">${(letter.recipient_name||'').slice(0,200)}</div>`
+        if (letter.recipient_title) html += `<div style="font-size:10.5pt; color:#222">${(letter.recipient_title||'').slice(0,200)}</div>`
+        if (letter.recipient_address) html += `<div style="white-space:pre-line; font-size:10.5pt; margin-top:2px">${(letter.recipient_address||'').slice(0,500)}</div>`
+        html += `</div>`
+        blockList.push({ id: 'recipient', type: 'recipient', html, keepTogether: true })
+      }
 
-    // Body - split into blocks to avoid cutting
-    const bodyHtml = letter.body || '<p style="color:#999">Start typing your letter...</p>'
-    try {
-      const doc = new DOMParser().parseFromString(`<div>${bodyHtml}</div>`, 'text/html')
-      const root = doc.body.firstChild
-      if (root) {
-        Array.from(root.childNodes).forEach((node, idx) => {
-          if (node.nodeType === 3) {
-            const txt = node.textContent.trim()
-            if (txt) {
-              blockList.push({
-                id: `body-text-${idx}`,
-                type: 'paragraph',
-                html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:10px 0; font-size:11.5pt; line-height:1.65">${txt}</div>`,
-                keepTogether: false
-              })
-            }
-            return
-          }
-          if (node.nodeType === 1) {
-            const tag = node.tagName.toLowerCase()
-            const outer = node.outerHTML
-            // Wrap each top-level element as a block with avoid-break
-            // For tables, keep header together but allow table to be its own block
-            if (tag === 'table') {
-              blockList.push({
-                id: `body-table-${idx}`,
-                type: 'table',
-                html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:18px 0">${outer}</div>`,
-                keepTogether: true,
-                isTable: true
-              })
-            } else if (['ul','ol'].includes(tag)) {
-              blockList.push({
-                id: `body-list-${idx}`,
-                type: 'list',
-                html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:12px 0">${outer}</div>`,
-                keepTogether: true
-              })
-            } else {
-              // p, div, h1-h6, etc - keep paragraph together
-              blockList.push({
-                id: `body-${idx}`,
-                type: tag,
-                html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:10px 0">${outer}</div>`,
-                keepTogether: tag !== 'div'
-              })
-            }
-          }
+      if (letter.subject) {
+        blockList.push({
+          id: 'subject',
+          type: 'subject',
+          html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:16px 0 14px 0; font-size:11pt"><span style="font-weight:700">Subject: </span><span style="font-weight:700; text-decoration:underline; text-underline-offset:3px">${(letter.subject||'').slice(0,300)}</span></div>`,
+          keepTogether: true
         })
-      } else {
+      }
+
+      if (letter.salutation) {
+        blockList.push({
+          id: 'salutation',
+          type: 'salutation',
+          html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:12px 0 16px 0; font-size:11.5pt">${(letter.salutation||'').slice(0,200)}</div>`,
+          keepTogether: true
+        })
+      }
+
+      const bodyHtml = (letter.body || '<p style="color:#999">Start typing your letter...</p>').slice(0, 100000)
+      try {
+        const doc = new DOMParser().parseFromString(`<div>${bodyHtml}</div>`, 'text/html')
+        const root = doc.body.firstChild
+        if (root) {
+          let count = 0
+          Array.from(root.childNodes).forEach((node, idx) => {
+            if (count > 150) return
+            try {
+              if (node.nodeType === 3) {
+                const txt = (node.textContent||'').trim().slice(0,2000)
+                if (txt) {
+                  blockList.push({
+                    id: `body-text-${idx}`,
+                    type: 'paragraph',
+                    html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:10px 0; font-size:11.5pt; line-height:1.65">${txt}</div>`,
+                    keepTogether: false
+                  })
+                  count++
+                }
+                return
+              }
+              if (node.nodeType === 1) {
+                const tag = node.tagName.toLowerCase()
+                let outer = ''
+                try { outer = node.outerHTML.slice(0, 20000) } catch { outer = `<p>${(node.textContent||'').slice(0,2000)}</p>` }
+                if (tag === 'table') {
+                  blockList.push({
+                    id: `body-table-${idx}`,
+                    type: 'table',
+                    html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:18px 0">${outer}</div>`,
+                    keepTogether: true,
+                    isTable: true
+                  })
+                } else if (['ul','ol'].includes(tag)) {
+                  blockList.push({
+                    id: `body-list-${idx}`,
+                    type: 'list',
+                    html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:12px 0">${outer}</div>`,
+                    keepTogether: true
+                  })
+                } else {
+                  blockList.push({
+                    id: `body-${idx}`,
+                    type: tag,
+                    html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:10px 0">${outer}</div>`,
+                    keepTogether: tag !== 'div'
+                  })
+                }
+                count++
+              }
+            } catch {}
+          })
+        } else {
+          blockList.push({
+            id: 'body-fallback',
+            type: 'body',
+            html: `<div class="letter-block" style="break-inside:avoid; margin:10px 0">${bodyHtml.slice(0,10000)}</div>`,
+            keepTogether: false
+          })
+        }
+      } catch (e) {
+        console.warn('body parse failed', e)
         blockList.push({
           id: 'body-fallback',
           type: 'body',
-          html: `<div class="letter-block" style="break-inside:avoid; margin:10px 0">${bodyHtml}</div>`,
+          html: `<div class="letter-block" style="margin:10px 0"><p>${(letter.body||'').replace(/<[^>]+>/g,' ').slice(0,5000)}</p></div>`,
           keepTogether: false
         })
       }
-    } catch {
-      blockList.push({
-        id: 'body-fallback',
-        type: 'body',
-        html: `<div class="letter-block" style="margin:10px 0">${bodyHtml}</div>`,
-        keepTogether: false
-      })
+
+      const signOffHtml = `
+        <div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-top:36px; line-height:1.5">
+          <div style="font-size:11.5pt; margin-bottom:6px">${(letter.closing_line || 'Yours sincerely,').slice(0,100)}</div>
+          ${showSignature ? `<img src="/sign.png" alt="signature" style="height:68px; margin:12px 0 8px 0; object-fit:contain; display:block" onerror="this.style.display='none'" />` : '<div style="height:48px"></div>'}
+          <div style="font-weight:800; font-size:12pt; letter-spacing:0.2px; margin-top:4px">${OWNER.name}</div>
+          <div style="font-weight:700; font-size:10.5pt; color:#222">${OWNER.position}</div>
+        </div>`
+      blockList.push({ id: 'signoff', type: 'signoff', html: signOffHtml, keepTogether: true })
+
+      return blockList.slice(0, 200)
+    } catch (e) {
+      console.error('blocks useMemo failed', e)
+      return [
+        { id: 'error', html: `<div style="color:#b71c1c; padding:10px; border:1px solid #ffcdd2; border-radius:8px">Preview error: ${e.message}. Showing simplified view.</div>` },
+        { id: 'refdate', html: `<div>Ref: ${letter.reference_no||''} - ${letter.letter_date||''}</div>` },
+        { id: 'body', html: `<div>${(letter.body||'').slice(0,5000)}</div>` }
+      ]
     }
-
-    // Sign-off - keep together
-    const signOffHtml = `
-      <div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-top:36px; line-height:1.5">
-        <div style="font-size:11.5pt; margin-bottom:6px">${letter.closing_line || 'Yours sincerely,'}</div>
-        ${showSignature ? `<img src="/sign.png" alt="signature" style="height:68px; margin:12px 0 8px 0; object-fit:contain; display:block; filter: contrast(1.2)" />` : '<div style="height:48px"></div>'}
-        <div style="font-weight:800; font-size:12pt; letter-spacing:0.2px; margin-top:4px">${OWNER.name}</div>
-        <div style="font-weight:700; font-size:10.5pt; color:#222">${OWNER.position}</div>
-      </div>`
-    blockList.push({ id: 'signoff', type: 'signoff', html: signOffHtml, keepTogether: true })
-
-    return blockList
   }, [letter, showSignature])
 
   useEffect(() => {
-    if (!contentMeasureRef.current) return
-    const measurer = contentMeasureRef.current
-    const contentWidth = 794 - margins.p1.left - margins.p1.right
-    measurer.style.width = contentWidth + 'px'
+    try {
+      if (!contentMeasureRef.current) return
+      const measurer = contentMeasureRef.current
+      const contentWidth = 794 - margins.p1.left - margins.p1.right
+      measurer.style.width = contentWidth + 'px'
 
-    // Measure each block
-    const measurements = []
-    for (const block of blocks) {
-      measurer.innerHTML = block.html
-      // Force layout
-      const h = measurer.scrollHeight
-      // Add a little safety margin (8px) to avoid tight fit
-      measurements.push({ ...block, measuredHeight: h + 4 })
-    }
-
-    // Paginate with keep-together logic
-    const p1Usable = 1123 - margins.p1.top - margins.p1.bottom
-    const p2Usable = 1123 - margins.p2.top - margins.p2.bottom
-
-    const pages = []
-    let currentPageBlocks = []
-    let currentHeight = 0
-    let currentUsable = p1Usable
-    let pageIndex = 0
-
-    for (let i = 0; i < measurements.length; i++) {
-      const blk = measurements[i]
-      const blkH = blk.measuredHeight
-
-      // If block is taller than usable space (e.g. huge table), put it alone on a page
-      // It will overflow but we keep it from cutting small blocks
-      if (blkH > currentUsable) {
-        if (currentPageBlocks.length > 0) {
-          // Finish current page first
-          pages.push(currentPageBlocks)
-          currentPageBlocks = []
-          currentHeight = 0
-          pageIndex++
-          currentUsable = p2Usable
+      const measurements = []
+      for (const block of blocks) {
+        try {
+          measurer.innerHTML = block.html
+          const h = measurer.scrollHeight || 40
+          measurements.push({ ...block, measuredHeight: Math.min(h + 4, 800) })
+        } catch {
+          measurements.push({ ...block, measuredHeight: 60 })
         }
-        // If block itself is taller than even p2 usable, we still put it on its own page
-        // and allow it to flow - better than cutting previous content
-        // For tables taller than page, we try to split rows if possible
-        if (blk.isTable && blkH > currentUsable * 1.2) {
-          // Try to split table rows across pages - fallback: keep whole table on page, will be cut but we move to next page
-          // For now, put table alone
-          pages.push([blk])
-          currentPageBlocks = []
-          currentHeight = 0
-          pageIndex++
-          currentUsable = p2Usable
-          continue
-        } else {
-          // Normal block that is too tall - put alone
-          if (blkH > currentUsable) {
-            // If first block on page and still too tall, allow it (will be slightly cut but no previous content cut)
-            // Actually we put it anyway
-            currentPageBlocks.push(blk)
+      }
+
+      const p1Usable = 1123 - margins.p1.top - margins.p1.bottom
+      const p2Usable = 1123 - margins.p2.top - margins.p2.bottom
+
+      const pages = []
+      let currentPageBlocks = []
+      let currentHeight = 0
+      let currentUsable = p1Usable
+
+      for (let i = 0; i < measurements.length; i++) {
+        const blk = measurements[i]
+        const blkH = blk.measuredHeight
+
+        if (blkH > currentUsable) {
+          if (currentPageBlocks.length > 0) {
             pages.push(currentPageBlocks)
             currentPageBlocks = []
             currentHeight = 0
-            pageIndex++
+            currentUsable = p2Usable
+          }
+          if (blk.isTable && blkH > currentUsable * 1.2) {
+            pages.push([blk])
+            currentPageBlocks = []
+            currentHeight = 0
             currentUsable = p2Usable
             continue
+          } else {
+            if (blkH > currentUsable) {
+              currentPageBlocks.push(blk)
+              pages.push(currentPageBlocks)
+              currentPageBlocks = []
+              currentHeight = 0
+              currentUsable = p2Usable
+              continue
+            }
           }
         }
-      }
 
-      if (currentHeight + blkH > currentUsable) {
-        // Not enough space - move to next page
-        pages.push(currentPageBlocks)
-        currentPageBlocks = [blk]
-        currentHeight = blkH
-        pageIndex++
-        currentUsable = p2Usable
-      } else {
-        currentPageBlocks.push(blk)
-        currentHeight += blkH
+        if (currentHeight + blkH > currentUsable) {
+          pages.push(currentPageBlocks)
+          currentPageBlocks = [blk]
+          currentHeight = blkH
+          currentUsable = p2Usable
+        } else {
+          currentPageBlocks.push(blk)
+          currentHeight += blkH
+        }
       }
+      if (currentPageBlocks.length > 0) pages.push(currentPageBlocks)
+      if (pages.length === 0) pages.push(measurements)
+
+      setPagesData(pages)
+      setError(null)
+    } catch (e) {
+      console.error('LetterPreview pagination failed', e)
+      setError(e.message)
+      // Fallback to single page with all blocks
+      setPagesData([blocks])
     }
-    if (currentPageBlocks.length > 0) pages.push(currentPageBlocks)
-
-    if (pages.length === 0) pages.push(measurements)
-
-    setPagesData(pages)
-    setTotalPages(pages.length)
   }, [blocks, margins])
+
+  if (error) {
+    return (
+      <div style={{ width: '100%' }}>
+        <div style={{ background: '#fff3f3', border: '1px solid #ffcdd2', borderRadius: 12, padding: 16, marginBottom: 16, fontSize: 13, color: '#b71c1c' }}>
+          Preview pagination error: {error} — showing fallback
+        </div>
+        <div className="a4-page" style={{ width: 794, minHeight: 1123, position: 'relative' }}>
+          <img src="/letter1.png" alt="letterhead" className="a4-bg" onError={(e)=>e.target.style.display='none'} />
+          <div style={{ position: 'absolute', left: margins.p1.left, right: margins.p1.right, top: margins.p1.top, bottom: margins.p1.bottom, overflow: 'auto', fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.65 }}>
+            {blocks.map(b => <div key={b.id} dangerouslySetInnerHTML={{ __html: b.html }} />)}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div ref={containerRef} style={{ width: '100%' }}>
-      {/* hidden measurer - same styling as preview content */}
       <div ref={contentMeasureRef} style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none', left: -9999, top: 0, fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.65, color: '#111' }} />
 
       {pagesData.map((pageBlocks, idx) => {
@@ -1281,7 +1274,7 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
         const m = isFirst ? margins.p1 : margins.p2
         return (
           <div key={idx} className="a4-page" style={{ width: 794, height: 1123, position: 'relative' }}>
-            <img src={bg} alt="letterhead" className="a4-bg" />
+            <img src={bg} alt="letterhead" className="a4-bg" onError={(e)=>e.target.style.display='none'} />
             <div style={{ position: 'absolute', left: m.left, right: m.right, top: m.top, bottom: m.bottom, overflow: 'hidden' }}>
               <div style={{ width: '100%', fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.65, color: '#111' }}>
                 {pageBlocks.map(b => (
@@ -1290,15 +1283,13 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
               </div>
             </div>
             <div style={{ position: 'absolute', bottom: 10, right: 18, fontSize: 9, color: '#999', fontFamily: 'Nunito Sans', letterSpacing: 0.3 }}>Page {idx + 1} of {pagesData.length}</div>
-            {isFirst && (
-              <div style={{ position: 'absolute', top: m.top - 38, left: m.left, right: m.right, height: 2, background: 'linear-gradient(90deg, transparent, rgba(201,162,39,0.15), transparent)', pointerEvents: 'none' }} />
-            )}
           </div>
         )
       })}
     </div>
   )
 }
+
 
 // ---------- PDF Export (lazy-loaded) - ROBUST FIX ----------
 async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature = true) {
@@ -2125,7 +2116,9 @@ export default function App() {
                 </div>
               </div>
               <div style={{ overflowX: 'auto' }} className="scrollbar-thin">
-                <LetterPreview letter={current} margins={margins} showSignature={current.signature_applied} />
+                <ErrorBoundary onReset={()=>{}}>
+                  <LetterPreview letter={current} margins={margins} showSignature={current.signature_applied} />
+                </ErrorBoundary>
               </div>
             </div>
           </div>

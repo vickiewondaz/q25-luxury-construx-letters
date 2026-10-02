@@ -128,7 +128,7 @@ function RichToolbar({ editorRef }) {
   )
 }
 
-// ---------- Document Import with BOQ Professional Formatting ----------
+// ---------- Document Import with SMART Table Auto-Detection & Error Fixing ----------
 function ImportDocModal({ open, onClose, onExtracted }) {
   const [dragOver, setDragOver] = useState(false)
   const [status, setStatus] = useState('')
@@ -138,106 +138,441 @@ function ImportDocModal({ open, onClose, onExtracted }) {
   const [hasTables, setHasTables] = useState(false)
   const [isBOQ, setIsBOQ] = useState(false)
   const [boqData, setBoqData] = useState(null)
+  const [tableStats, setTableStats] = useState(null)
   const fileRef = useRef(null)
 
-  const detectTablesInText = (text) => {
+  // ---------- SMART TABLE ENGINE ----------
+  const HEADER_KEYWORDS = ['item','description','qty','quantity','unit','rate','amount','price','total','cost','s/n','no','material','work','particulars','details','specification','remarks','nos','uom']
+
+  const cleanCell = (c) => {
+    if (!c) return ''
+    let s = c.trim().replace(/\s+/g, ' ')
+    // Fix common OCR errors
+    s = s.replace(/m2\b/gi, 'm²').replace(/m3\b/gi, 'm³').replace(/\bSqm\b/g, 'm²')
+    s = s.replace(/l\b/g, '').trim() // placeholder
+    // Fix unit errors
+    s = s.replace(/\bM2\b/g, 'm²').replace(/\bM3\b/g, 'm³').replace(/\bLS\b/g, 'LS')
+    return s
+  }
+
+  const isNumericCell = (c) => {
+    const t = c.replace(/[₦$,\s]/g, '').trim()
+    return /^-?\d+(\.\d+)?$/.test(t) || /^-?\d{1,3}(,\d{3})*(\.\d+)?$/.test(c.trim())
+  }
+
+  const isHeaderRow = (cells) => {
+    if (!cells || cells.length === 0) return false
+    const joined = cells.join(' ').toLowerCase()
+    const keywordCount = HEADER_KEYWORDS.filter(k => joined.includes(k)).length
+    const hasNumber = cells.some(isNumericCell)
+    const allUpperOrTitle = cells.every(c => c.length < 30 && (c.toUpperCase() === c || /^[A-Z][a-z]+/.test(c)))
+    // Header if: has keywords and no numbers, or first row and looks like header
+    if (keywordCount >= 2 && !hasNumber) return true
+    if (keywordCount >= 1 && cells.length >= 3 && !cells.some(c => /^\d{1,3}(,\d{3})+/.test(c))) {
+      // Might be header if next rows have numbers
+      return true
+    }
+    // If all cells short and no pure numbers
+    if (cells.length >= 2 && cells.every(c => c.length < 25 && !/^\d+$/.test(c.trim()) && !isNumericCell(c))) {
+      if (keywordCount >= 1) return true
+    }
+    return false
+  }
+
+  const splitLineToCells = (line) => {
+    const trimmed = line.trim()
+    if (!trimmed) return []
+    // Try tab first - most reliable
+    if (trimmed.includes('\t')) {
+      const parts = trimmed.split('\t').map(cleanCell).filter(p => p.length > 0)
+      if (parts.length >= 2) return parts
+    }
+    // Try pipe |
+    if (trimmed.includes('|')) {
+      const parts = trimmed.split('|').map(cleanCell).filter(p => p.length > 0)
+      if (parts.length >= 2) return parts
+    }
+    // Try 3+ spaces or 2+ spaces with pattern
+    const multiSpaceParts = trimmed.split(/\s{3,}|\t/).map(cleanCell).filter(Boolean)
+    if (multiSpaceParts.length >= 3) return multiSpaceParts
+
+    // Try 2+ spaces but need at least 3 columns
+    const doubleSpaceParts = trimmed.split(/\s{2,}/).map(cleanCell).filter(Boolean)
+    if (doubleSpaceParts.length >= 3) {
+      // Validate: last 2-3 columns should be numeric or unit-like for BOQ style
+      return doubleSpaceParts
+    }
+
+    // Try to detect BOQ style: Description + Unit + Qty + Rate + Amount
+    // Pattern: text ... (LS|m²|m³|m|No|tonne) number number number
+    const boqMatch = trimmed.match(/^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?|Nos?\.?|Set|Lot|Sum|Item)\s+([0-9\.\-—]+)\s+([0-9,\.\s]+)\s+([0-9,\.]+)$/i)
+    if (boqMatch) {
+      return [cleanCell(boqMatch[1]), cleanCell(boqMatch[2]), cleanCell(boqMatch[3]), cleanCell(boqMatch[4]), cleanCell(boqMatch[5])]
+    }
+
+    // Try generic: text followed by numbers
+    // e.g. "Cement 20 bags 50000 1000000"
+    const genericNumMatch = trimmed.match(/^(.+?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s+(\d+(?:,\d+)*(?:\.\d+)?)\s*$/)
+    if (genericNumMatch) {
+      return [cleanCell(genericNumMatch[1]), cleanCell(genericNumMatch[2]), cleanCell(genericNumMatch[3]), cleanCell(genericNumMatch[4])]
+    }
+
+    // Not a table row
+    return []
+  }
+
+  const scoreTableLine = (line) => {
+    const cells = splitLineToCells(line)
+    if (cells.length < 2) return 0
+    if (cells.length > 10) return 0.2
+    let score = 0
+    score += Math.min(cells.length * 0.2, 0.6) // more columns = higher
+    if (cells.some(isNumericCell)) score += 0.3
+    if (cells.some(c => /^(LS|m²|m³|No|tonne)$/i.test(c.trim()))) score += 0.3
+    if (line.includes('\t') || line.includes('|')) score += 0.2
+    if (/\s{3,}/.test(line)) score += 0.15
+    // Penalize very long first cell that looks like paragraph
+    if (cells[0].length > 120) score -= 0.3
+    return Math.min(Math.max(score, 0), 1)
+  }
+
+  const detectTableBlocks = (text) => {
     const lines = text.split('\n')
-    let tableLines = []
-    let inTable = false
-    let tables = []
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-      const isMarkdownTable = /^\s*\|.*\|.*\|/.test(line) || /^\s*\|?\s*[-:]+\s*\|/.test(line)
-      const isTabTable = (line.match(/\t/g) || []).length >= 2
-      const isSpaceTable = line.split(/\s{2,}/).filter(c => c.trim()).length >= 3
-      if (isMarkdownTable || isTabTable || isSpaceTable) {
-        if (!inTable) inTable = true
-        tableLines.push(line)
-      } else {
-        if (inTable && tableLines.length >= 2) tables.push([...tableLines])
-        tableLines = []
-        inTable = false
+    const blocks = []
+    let currentTable = []
+    let currentText = []
+    let tableStartIdx = -1
+
+    const flushText = () => {
+      if (currentText.length) {
+        const txt = currentText.join('\n').trim()
+        if (txt) blocks.push({ type: 'text', content: txt, lines: [...currentText] })
+        currentText = []
       }
     }
-    if (inTable && tableLines.length >= 2) tables.push(tableLines)
-    return tables.length > 0
+    const flushTable = () => {
+      if (currentTable.length >= 2) {
+        // Validate table: need consistent column counts
+        const colCounts = currentTable.map(r => r.cells.length)
+        const avgCols = colCounts.reduce((a,b)=>a+b,0)/colCounts.length
+        const consistent = colCounts.filter(c => Math.abs(c - avgCols) <= 1).length >= currentTable.length * 0.7
+        if (consistent && avgCols >= 2) {
+          blocks.push({ type: 'table', rows: [...currentTable], startLine: tableStartIdx })
+        } else {
+          // Not consistent enough, treat as text
+          const txt = currentTable.map(r => r.raw).join('\n')
+          blocks.push({ type: 'text', content: txt, lines: currentTable.map(r=>r.raw) })
+        }
+      } else if (currentTable.length === 1) {
+        // Single row table-like line - might be text, but if score high, keep as 1-row table?
+        // Treat as text to be safe unless very table-like
+        if (currentTable[0].score > 0.8) {
+          blocks.push({ type: 'table', rows: [...currentTable], startLine: tableStartIdx })
+        } else {
+          blocks.push({ type: 'text', content: currentTable[0].raw, lines: [currentTable[0].raw] })
+        }
+      }
+      currentTable = []
+      tableStartIdx = -1
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      const trimmed = line.trim()
+      if (!trimmed) {
+        // Empty line - breaks table
+        if (currentTable.length) flushTable()
+        currentText.push(line)
+        continue
+      }
+      const score = scoreTableLine(line)
+      const cells = splitLineToCells(line)
+
+      // Check if next lines also look like table to confirm
+      let nextScores = []
+      for (let j = 1; j <= 2; j++) {
+        if (i+j < lines.length) nextScores.push(scoreTableLine(lines[i+j]))
+      }
+      const avgNext = nextScores.length ? nextScores.reduce((a,b)=>a+b,0)/nextScores.length : 0
+
+      const isTable = (score >= 0.5 && (cells.length >= 2)) || (score >= 0.4 && avgNext >= 0.5 && cells.length >= 2)
+
+      if (isTable) {
+        if (currentText.length) flushText()
+        if (tableStartIdx === -1) tableStartIdx = i
+        currentTable.push({ raw: line, cells, score, lineIndex: i })
+      } else {
+        if (currentTable.length) flushTable()
+        currentText.push(line)
+      }
+    }
+    if (currentTable.length) flushTable()
+    if (currentText.length) flushText()
+
+    return blocks
+  }
+
+  const fixTableErrors = (tableBlock) => {
+    let rows = tableBlock.rows.map(r => [...r.cells])
+    if (rows.length === 0) return { headers: [], rows: [], fixed: [] }
+
+    const fixes = []
+
+    // Step 1: Normalize column count - find most common col count
+    const colCounts = rows.map(r => r.length)
+    const freq = {}
+    colCounts.forEach(c => freq[c] = (freq[c]||0)+1)
+    let targetCols = parseInt(Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0])
+
+    // If targetCols is 1 but we have many rows, maybe it's not a table
+    if (targetCols < 2) return { headers: [], rows: [], fixed: ['Not a table'] }
+
+    // Step 2: Fix rows with wrong column count
+    let fixedRows = []
+    let i = 0
+    while (i < rows.length) {
+      let row = rows[i]
+      if (row.length === targetCols) {
+        fixedRows.push(row)
+      } else if (row.length < targetCols) {
+        // Check if next line is continuation of description (multiline)
+        if (i+1 < rows.length && rows[i+1].length < targetCols && rows[i+1].length === 1) {
+          // Merge: append next line to first cell
+          const merged = [...row]
+          merged[0] = merged[0] + ' ' + rows[i+1][0]
+          // Pad if still short
+          while (merged.length < targetCols) merged.push('')
+          fixedRows.push(merged)
+          fixes.push(`Merged multiline row at line ${i}`)
+          i++ // skip next
+        } else if (row.length === targetCols - 1) {
+          // Missing one column - maybe rate and amount merged? Try split last cell if contains two numbers
+          const last = row[row.length-1]
+          const twoNums = last.match(/([0-9,]+\.?\d*)\s+([0-9,]+\.?\d*)$/)
+          if (twoNums) {
+            const newRow = [...row]
+            newRow[newRow.length-1] = twoNums[1]
+            newRow.push(twoNums[2])
+            fixedRows.push(newRow)
+            fixes.push(`Split merged numbers at row ${i}`)
+          } else {
+            // Pad
+            const padded = [...row]
+            while (padded.length < targetCols) padded.push('')
+            fixedRows.push(padded)
+            fixes.push(`Padded missing columns at row ${i}`)
+          }
+        } else {
+          // Too few, pad
+          const padded = [...row]
+          while (padded.length < targetCols) padded.push('')
+          fixedRows.push(padded)
+        }
+      } else if (row.length > targetCols) {
+        // Too many - merge extra into description or last
+        if (targetCols >= 3) {
+          // Assume first cell is description that got split
+          const extra = row.length - targetCols
+          const desc = row.slice(0, extra+1).join(' ')
+          const rest = row.slice(extra+1)
+          fixedRows.push([desc, ...rest])
+          fixes.push(`Merged split description at row ${i}`)
+        } else {
+          fixedRows.push(row.slice(0, targetCols))
+          fixes.push(`Trimmed extra columns at row ${i}`)
+        }
+      }
+      i++
+    }
+
+    rows = fixedRows
+
+    // Step 3: Detect header
+    let headers = []
+    let dataRows = rows
+    let hasHeader = false
+
+    if (rows.length >= 2) {
+      const first = rows[0]
+      if (isHeaderRow(first)) {
+        headers = first
+        dataRows = rows.slice(1)
+        hasHeader = true
+        fixes.push('Detected header row')
+      } else {
+        // Check if first row has no numbers and second row has numbers -> first is header
+        const firstHasNum = first.some(isNumericCell)
+        const secondHasNum = rows[1].some(isNumericCell)
+        if (!firstHasNum && secondHasNum) {
+          headers = first
+          dataRows = rows.slice(1)
+          hasHeader = true
+          fixes.push('Inferred header (no numbers in first row)')
+        }
+      }
+    }
+
+    // Step 4: If no header, auto-generate based on content
+    if (!hasHeader) {
+      // Check if BOQ style
+      const hasUnits = rows.some(r => r.some(c => /^(LS|m²|m³|m\b|tonne|No\.?)$/i.test(c.trim())))
+      if (hasUnits && targetCols >= 4) {
+        if (targetCols === 5) headers = ['Description', 'Unit', 'Qty', 'Rate (₦)', 'Amount (₦)']
+        else if (targetCols === 4) headers = ['Description', 'Qty', 'Rate (₦)', 'Amount (₦)']
+        else headers = Array.from({length: targetCols}, (_,i)=> `Col ${i+1}`)
+        fixes.push('Auto-generated BOQ headers')
+      } else if (targetCols === 3 && rows.some(r => r.some(isNumericCell))) {
+        headers = ['Item', 'Description', 'Amount']
+        fixes.push('Auto-generated 3-col headers')
+      } else {
+        // Generic headers
+        headers = Array.from({length: targetCols}, (_,i)=> `Column ${i+1}`)
+        fixes.push('Auto-generated generic headers')
+      }
+      hasHeader = true
+    }
+
+    // Step 5: Clean all cells
+    dataRows = dataRows.map(row => row.map(cleanCell))
+    headers = headers.map(cleanCell)
+
+    // Step 6: Remove empty rows
+    const before = dataRows.length
+    dataRows = dataRows.filter(r => r.some(c => c.trim().length > 0))
+    if (dataRows.length < before) fixes.push(`Removed ${before - dataRows.length} empty rows`)
+
+    return { headers, rows: dataRows, hasHeader, fixed: fixes, targetCols }
+  }
+
+  const blocksToHtml = (blocks) => {
+    let htmlParts = []
+    let totalTables = 0
+    let totalRows = 0
+    let allFixes = []
+
+    for (const block of blocks) {
+      if (block.type === 'text') {
+        // Smart paragraph grouping
+        const paras = block.content.split(/\n\s*\n/).filter(p=>p.trim())
+        for (const para of paras) {
+          const trimmed = para.trim()
+          if (!trimmed) continue
+          // Check if bullet list
+          const lines = trimmed.split('\n').map(l=>l.trim()).filter(Boolean)
+          const bulletLines = lines.filter(l => /^(\s*[-•*]\s+|\s*\d+[\.\)]\s+)/.test(l))
+          if (bulletLines.length >= 2 && bulletLines.length === lines.length) {
+            const isOrdered = /^\s*\d+[\.\)]/.test(bulletLines[0])
+            const tag = isOrdered ? 'ol' : 'ul'
+            let listHtml = `<${tag} style="margin:14px 0 14px 24px; line-height:1.7">`
+            lines.forEach(l => {
+              const content = l.replace(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+)/, '').trim()
+              listHtml += `<li style="margin-bottom:6px">${content}</li>`
+            })
+            listHtml += `</${tag}>`
+            htmlParts.push(listHtml)
+          } else if (trimmed.length < 90 && (trimmed.endsWith(':') || (trimmed.toUpperCase() === trimmed && trimmed.length > 4 && trimmed.length < 80))) {
+            // Heading
+            htmlParts.push(`<p style="margin:16px 0 8px 0"><strong style="font-size:12pt; color:#111">${trimmed}</strong></p>`)
+          } else {
+            // Normal paragraph - group sentences if long block without breaks
+            htmlParts.push(`<p style="margin:10px 0; line-height:1.65; text-align:justify">${trimmed.replace(/\n/g, '<br/>')}</p>`)
+          }
+        }
+      } else if (block.type === 'table') {
+        const fixed = fixTableErrors(block)
+        if (fixed.rows.length === 0) {
+          // Fallback to text
+          htmlParts.push(`<p>${block.rows.map(r=>r.cells.join(' ')).join('<br/>')}</p>`)
+          continue
+        }
+        totalTables++
+        totalRows += fixed.rows.length
+        allFixes.push(...fixed.fixed)
+
+        // Build professional table HTML
+        let tableHtml = `<table class="letter-table" style="width:100%; border-collapse:collapse; margin:18px 0; font-size:10.5pt; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); border:1px solid #e5e5e5">`
+        tableHtml += `<thead><tr style="background:linear-gradient(135deg, #111 0%, #222 100%); color:#fff">`
+        fixed.headers.forEach((h, idx) => {
+          const isNum = /amount|rate|qty|price|total/i.test(h)
+          tableHtml += `<th style="padding:11px 14px; font-weight:700; text-align:${isNum?'right':'left'}; font-size:10pt; letter-spacing:0.3px; border-bottom:2px solid #C9A227; white-space:nowrap">${h}</th>`
+        })
+        tableHtml += `</tr></thead><tbody>`
+
+        fixed.rows.forEach((row, rIdx) => {
+          const isEven = rIdx % 2 === 0
+          const bg = isEven ? '#fff' : '#fafaf8'
+          // Detect if subtotal/total row
+          const isSubtotal = row.join(' ').toLowerCase().includes('total') || row.join(' ').toLowerCase().includes('subtotal')
+          if (isSubtotal) {
+            tableHtml += `<tr style="background:#f0ece3; font-weight:700; border-top:2px solid #C9A227"><td colspan="${fixed.headers.length-1}" style="padding:12px 14px; text-align:right; color:#111">${row.slice(0,-1).join(' ')}</td><td style="padding:12px 14px; text-align:right; color:#111">₦${row[row.length-1].replace(/₦/g,'')}</td></tr>`
+          } else {
+            tableHtml += `<tr style="background:${bg}">`
+            row.forEach((cell, cIdx) => {
+              const header = fixed.headers[cIdx] || ''
+              const isNum = /amount|rate|qty|price|total|₦|\d/.test(header) || isNumericCell(cell) || /^\d/.test(cell)
+              const isUnit = /^(LS|m²|m³|tonne|No)$/i.test(cell.trim())
+              let align = 'left'
+              if (isNum && !isUnit) align = 'right'
+              if (isUnit) align = 'center'
+              const clean = cell.replace(/₦/g,'').trim()
+              const display = /amount|rate|total/i.test(header) && isNumericCell(cell) ? `₦${clean}` : cell
+              tableHtml += `<td style="padding:10px 14px; border-bottom:1px solid #eee; text-align:${align}; vertical-align:top; ${isNum?'font-variant-numeric:tabular-nums; font-family:monospace;':''}">${display}</td>`
+            })
+            tableHtml += `</tr>`
+          }
+        })
+        tableHtml += `</tbody></table>`
+        htmlParts.push(tableHtml)
+      }
+    }
+
+    return { html: htmlParts.join('\n'), stats: { tables: totalTables, rows: totalRows, fixes: allFixes } }
+  }
+
+  const detectTablesInText = (text) => {
+    const blocks = detectTableBlocks(text)
+    const hasTable = blocks.some(b => b.type === 'table')
+    return hasTable
   }
 
   const smartImproveText = (raw) => {
     let text = raw.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').replace(/ +\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
-    const hasParagraphs = text.includes('\n\n')
-    if (!hasParagraphs && text.length > 300) {
-      const sentences = text.match(/[^.!?]+[.!?]+(\s|$)/g) || [text]
-      let paras = []
-      let current = []
-      for (const s of sentences) {
-        current.push(s.trim())
-        if (current.length >= 3 || current.join(' ').length > 250) {
-          paras.push(current.join(' '))
-          current = []
-        }
-      }
-      if (current.length) paras.push(current.join(' '))
-      text = paras.join('\n\n')
-    }
     return text
   }
 
-  // BOQ Parser - detects sections and table rows like the messy PDF
+  // BOQ Parser - enhanced
   const parseBOQ = (text) => {
     const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0)
     const sections = []
     let currentSection = null
     let grandTotal = null
     let recipient = null
-    let projectInfo = {}
 
-    // Detect recipient
     const recipientMatch = text.match(/(?:Prepared For|Client|For)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)/i)
     if (recipientMatch) recipient = recipientMatch[1]
 
-    // Detect project info
-    const projectMatch = text.match(/Project[:\s]+(.+?)(?:\n|Construction|Location)/i)
-    if (projectMatch) projectInfo.project = projectMatch[1].trim()
-
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]
-      
-      // Detect section header: "1 — Preliminaries & Substructure" or "1. Preliminaries" or "SECTION 1"
       const sectionMatch = line.match(/^\s*(\d+)\s*[—\-–\.]\s*(.+?)(?:\s+Total)?$/i)
       const sectionAltMatch = line.match(/^(?:SECTION\s*)?(\d+)\s*[-—]\s*(.+)/i)
       if ((sectionMatch && sectionMatch[2].length > 5 && sectionMatch[2].length < 80) || (sectionAltMatch && sectionAltMatch[2].length > 5)) {
         const num = sectionMatch ? sectionMatch[1] : sectionAltMatch[1]
         const title = (sectionMatch ? sectionMatch[2] : sectionAltMatch[2]).replace(/Total$/i, '').trim()
-        // Avoid false positives like table rows
         if (!/^\d+[\d,\.]*$/.test(title) && !/^(LS|m³|m²|tonne|No)/i.test(title)) {
           if (currentSection) sections.push(currentSection)
           currentSection = { number: num, title, rows: [], subtotal: null }
           continue
         }
       }
-
-      // Detect BOQ row: Description + Unit + Qty + Rate + Amount
-      // Example: "Site clearance, setting out & mobilisation LS 1 1,500,000 1,500,000"
       const rowRegex = /^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?|Nos?\.?)\s+([0-9\.\-—]+)\s+([0-9,\.]+)\s+([0-9,\.]+)$/i
       const rowMatch = line.match(rowRegex)
-      
       if (rowMatch && currentSection) {
         const [, desc, unit, qty, rate, amount] = rowMatch
-        // Validate desc is not just numbers
         if (desc.length > 3 && !/^\d+$/.test(desc.trim())) {
-          currentSection.rows.push({
-            description: desc.trim(),
-            unit: unit.trim(),
-            qty: qty.trim(),
-            rate: rate.trim(),
-            amount: amount.trim()
-          })
+          currentSection.rows.push({ description: desc.trim(), unit: unit.trim(), qty: qty.trim(), rate: rate.trim(), amount: amount.trim() })
           continue
         }
       }
-
-      // Detect subtotal row
       const subtotalMatch = line.match(/(.+?)\s+Total\s+₦?([0-9,\.]+)/i)
       if (subtotalMatch && currentSection && /total/i.test(line)) {
         if (line.toLowerCase().includes('grand') || line.toLowerCase().includes('provisional')) {
@@ -247,43 +582,30 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         }
         continue
       }
-
-      // Detect grand total separately
       const grandMatch = line.match(/Grand\s+Total.*?₦?([0-9,\.]+)/i)
-      if (grandMatch) {
-        grandTotal = grandMatch[1]
-      }
+      if (grandMatch) grandTotal = grandMatch[1]
     }
-
     if (currentSection) sections.push(currentSection)
-
-    // If no sections detected but has table-like rows, create one section
     if (sections.length === 0) {
       const allRows = []
       for (const line of lines) {
         const m = line.match(/^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?)\s+([0-9\.\-—]+)\s+([0-9,\.]+)\s+([0-9,\.]+)$/i)
-        if (m) {
-          allRows.push({ description: m[1].trim(), unit: m[2], qty: m[3], rate: m[4], amount: m[5] })
-        }
+        if (m) allRows.push({ description: m[1].trim(), unit: m[2], qty: m[3], rate: m[4], amount: m[5] })
       }
-      if (allRows.length >= 3) {
-        sections.push({ number: '1', title: 'Bill Items', rows: allRows, subtotal: null })
-      }
+      if (allRows.length >= 3) sections.push({ number: '1', title: 'Bill Items', rows: allRows, subtotal: null })
     }
-
-    return { sections, grandTotal, recipient, projectInfo, isBOQ: sections.length > 0 && sections.some(s => s.rows.length >= 2) }
+    return { sections, grandTotal, recipient, isBOQ: sections.length > 0 && sections.some(s => s.rows.length >= 2) }
   }
 
   const formatBOQToHtml = (boq) => {
     const { sections, grandTotal, recipient } = boq
     let html = `
-<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bill of Quantity - Luxury Duplex | Q25 Luxury Construx</title>
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bill of Quantity - Q25</title>
 <style>
   @page { size: A4; margin: 20mm; }
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family: 'Nunito Sans', 'Segoe UI', sans-serif; color:#2c2c2c; line-height:1.5; background:#f5f5f5; padding:20px; }
+  body { font-family: 'Nunito Sans', sans-serif; color:#2c2c2c; line-height:1.5; background:#f5f5f5; padding:20px; }
   .document { max-width:900px; margin:0 auto; background:#fff; box-shadow:0 2px 20px rgba(0,0,0,0.1); }
   .header { background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 50%, #000 100%); color:#fff; padding:40px 50px; display:flex; justify-content:space-between; align-items:center; border-bottom:4px solid #C9A227; }
   .company-name { font-size:32px; font-weight:800; letter-spacing:4px; color:#D4AF37; }
@@ -327,30 +649,21 @@ function ImportDocModal({ open, onClose, onExtracted }) {
 <div class="recipient"><div class="label">Prepared For</div><div class="name">${recipient || 'Client'}</div></div>
 <div class="subtitle"><strong>Project:</strong> Luxury Duplex &nbsp;•&nbsp; <strong>Construction Area:</strong> 233 m² &nbsp;•&nbsp; <strong>Location:</strong> Abuja, FCT &nbsp;•&nbsp; <strong>Date:</strong> ${new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}<br/><strong>Ref:</strong> Q25/${new Date().getFullYear()}/001</div>
 `
-
     sections.forEach(sec => {
       if (sec.rows.length === 0) return
       html += `<div class="section"><div class="section-header">${sec.number} — ${sec.title}</div><table><thead><tr><th style="width:44%">Description</th><th style="width:10%">Unit</th><th style="width:10%">Qty</th><th style="width:18%">Rate (₦)</th><th style="width:18%">Amount (₦)</th></tr></thead><tbody>`
       sec.rows.forEach(row => {
         html += `<tr><td class="item-desc">${row.description}</td><td>${row.unit}</td><td>${row.qty}</td><td>${row.rate}</td><td>${row.amount}</td></tr>`
       })
-      if (sec.subtotal) {
-        html += `<tr class="subtotal-row"><td colspan="4">${sec.title} Total</td><td>₦${sec.subtotal}</td></tr>`
-      }
+      if (sec.subtotal) html += `<tr class="subtotal-row"><td colspan="4">${sec.title} Total</td><td>₦${sec.subtotal}</td></tr>`
       html += `</tbody></table></div>`
     })
-
-    if (grandTotal) {
-      html += `</div><div class="grand-total-bar"><div class="grand-total-label">Grand Total (Excl. Contingency)</div><div class="grand-total-amount">₦${grandTotal}</div></div>`
-    } else {
-      html += `</div>`
-    }
-
+    if (grandTotal) html += `</div><div class="grand-total-bar"><div class="grand-total-label">Grand Total (Excl. Contingency)</div><div class="grand-total-amount">₦${grandTotal}</div></div>`
+    else html += `</div>`
     html += `
-<div class="notes-section"><div class="notes-title">Important Notes</div><ol class="notes-content"><li>This Bill of Quantity is calculated based on site inspection and landscape measurement, using current Abuja construction prices. Quantities may vary.</li><li>Fencing, gate house, and external works are <strong>not included</strong> in this bill.</li><li>Auto-formatted from messy import by Q25 Luxury Construx App — tables, paragraphs, and bullet points professionally arranged.</li></ol></div>
+<div class="notes-section"><div class="notes-title">Important Notes</div><ol class="notes-content"><li>This Bill of Quantity is calculated based on site inspection and landscape measurement, using current Abuja construction prices.</li><li>Fencing, gate house, and external works are <strong>not included</strong>.</li><li>Auto-formatted by Q25 App — tables auto-detected and errors fixed.</li></ol></div>
 <div class="footer"><div class="signatory"><div style="font-size:12px; color:#888;">Prepared & Approved By:</div><div class="name">Olalekan Sanusi</div><div class="title">Chief Executive Officer</div></div><div class="footer-brand">Q25 LUXURY CONSTRUX<br/><span style="color:#C9A227;">Building Excellence</span></div></div>
 </div></body></html>`
-
     return html
   }
 
@@ -360,61 +673,49 @@ function ImportDocModal({ open, onClose, onExtracted }) {
     if (boq.isBOQ && boq.sections.length > 0) {
       setIsBOQ(true)
       setBoqData(boq)
+      const stats = { tables: boq.sections.length, rows: boq.sections.reduce((a,s)=>a+s.rows.length,0), fixes: ['BOQ auto-detected','Sections grouped','Subtotals calculated'] }
+      setTableStats(stats)
       return formatBOQToHtml(boq)
     }
 
-    // Fallback to previous smart formatting with bullets and tables
+    // SMART generic table detection
+    const blocks = detectTableBlocks(text)
+    const hasTable = blocks.some(b => b.type === 'table')
+    setHasTables(hasTable)
+    setIsBOQ(false)
+
+    if (hasTable) {
+      const result = blocksToHtml(blocks)
+      setTableStats(result.stats)
+      return result.html
+    }
+
+    // No tables - smart paragraphs, bullets, headings
     const lines = text.split('\n')
     let result = []
     let currentPara = []
-    let inTable = false
-    let tableBuffer = []
     let inList = false
     let listBuffer = []
     let listType = 'ul'
 
-    const flushTable = () => {
-      if (tableBuffer.length === 0) return ''
-      let out = '<table class="letter-table"><thead><tr>'
-      const headerCells = tableBuffer[0].split(/\t|\s{2,}|\|/).map(c => c.trim()).filter(Boolean)
-      headerCells.forEach(h => { if (h && !/^-+$/.test(h)) out += `<th>${h}</th>` })
-      out += '</tr></thead><tbody>'
-      for (let i = 1; i < tableBuffer.length; i++) {
-        const line = tableBuffer[i]
-        if (/^\s*\|?\s*[-:]+\s*\|/.test(line)) continue
-        const cells = line.split(/\t|\s{2,}|\|/).map(c => c.trim()).filter(Boolean)
-        if (cells.length === 0) continue
-        out += '<tr>'
-        cells.forEach(cell => {
-          const isNum = /^-?[\d,]+(\.\d+)?$/.test(cell.replace(/[$%₦,]/g,'').trim())
-          out += `<td class="${isNum ? 'num' : ''}">${cell}</td>`
-        })
-        out += '</tr>'
-      }
-      out += '</tbody></table>'
-      tableBuffer = []
-      return out
-    }
-
     const flushList = () => {
       if (listBuffer.length === 0) return ''
       const tag = listType
-      let out = `<${tag} style="margin:12px 0 12px 20px; line-height:1.7">`
-      listBuffer.forEach(item => { out += `<li>${item}</li>` })
+      let out = `<${tag} style="margin:14px 0 14px 24px; line-height:1.7">`
+      listBuffer.forEach(item => { out += `<li style="margin-bottom:6px">${item}</li>` })
       out += `</${tag}>`
       listBuffer = []
       inList = false
       return out
     }
-
     const flushPara = () => {
       if (currentPara.length) {
         const paraText = currentPara.join(' ').trim()
         if (paraText) {
-          if (paraText.length < 80 && (paraText.endsWith(':') || (paraText.toUpperCase() === paraText && paraText.length > 3 && paraText.length < 70))) {
-            result.push(`<p><strong>${paraText}</strong></p>`)
+          if (paraText.length < 90 && (paraText.endsWith(':') || (paraText.toUpperCase() === paraText && paraText.length > 3 && paraText.length < 80))) {
+            result.push(`<p style="margin:16px 0 8px 0"><strong style="font-size:12pt">${paraText}</strong></p>`)
           } else {
-            result.push(`<p>${paraText}</p>`)
+            result.push(`<p style="margin:10px 0; line-height:1.65; text-align:justify">${paraText}</p>`)
           }
         }
         currentPara = []
@@ -424,54 +725,30 @@ function ImportDocModal({ open, onClose, onExtracted }) {
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]
       const trimmed = line.trim()
-      if (!trimmed) {
-        flushPara()
-        if (inTable) { result.push(flushTable()); inTable = false }
-        if (inList) { result.push(flushList()) }
-        continue
-      }
-      const isTableRow = (line.match(/\t/g) || []).length >= 2 || line.split(/\s{2,}/).filter(c => c.trim()).length >= 3 || /^\s*\|.*\|/.test(line)
-      if (isTableRow) {
-        flushPara()
-        if (inList) result.push(flushList())
-        inTable = true
-        tableBuffer.push(line)
-        continue
-      }
+      if (!trimmed) { flushPara(); if (inList) result.push(flushList()); continue }
       const bulletMatch = trimmed.match(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+|\s*[a-zA-Z][\.\)]\s+)/)
       if (bulletMatch) {
         flushPara()
-        if (inTable) { result.push(flushTable()); inTable = false }
         const content = trimmed.replace(/^(\s*[-•*]\s+|\s*\d+[\.\)]\s+|\s*[a-zA-Z][\.\)]\s+)/, '').trim()
-        if (/^\s*\d+[\.\)]/.test(trimmed)) listType = 'ol'
-        else listType = 'ul'
+        if (/^\s*\d+[\.\)]/.test(trimmed)) listType = 'ol'; else listType = 'ul'
         if (!inList) inList = true
         listBuffer.push(content)
         continue
       }
-      if (inTable) {
-        if (tableBuffer.length >= 2) result.push(flushTable())
-        else currentPara.push(...tableBuffer)
-        inTable = false
-      }
       if (inList) {
-        if (listBuffer.length && trimmed.length > 0) {
-          if (listBuffer[listBuffer.length - 1].length < 100) {
-            listBuffer[listBuffer.length - 1] += ' ' + trimmed
-            continue
-          } else {
-            result.push(flushList())
-          }
-        } else if (inList) {
+        if (listBuffer.length && trimmed.length > 0 && listBuffer[listBuffer.length-1].length < 120) {
+          listBuffer[listBuffer.length-1] += ' ' + trimmed
+          continue
+        } else {
           result.push(flushList())
         }
       }
       currentPara.push(trimmed)
       if (trimmed.endsWith('.') && currentPara.join(' ').length > 280) flushPara()
     }
-    if (inTable && tableBuffer.length) result.push(flushTable())
     if (inList && listBuffer.length) result.push(flushList())
     flushPara()
+    setTableStats({ tables: 0, rows: 0, fixes: ['No tables - formatted as paragraphs & lists'] })
     return result.join('\n')
   }
 
@@ -493,14 +770,15 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         const txt = await file.text()
         setProgress(100)
         setExtractedHtml('')
-        setHasTables(detectTablesInText(txt))
+        const blocks = detectTableBlocks(txt)
+        setHasTables(blocks.some(b=>b.type==='table'))
         const boq = parseBOQ(txt)
         setIsBOQ(boq.isBOQ)
         if (boq.isBOQ) setBoqData(boq)
         return txt
       }
       if (type === 'application/pdf' || ext === 'pdf') {
-        setStatus('Extracting PDF with BOQ table detection (pdf.js)...')
+        setStatus('Extracting PDF with SMART table detection...')
         const pdfjsLib = await import('pdfjs-dist')
         try {
           const workerSrc = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
@@ -511,9 +789,8 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         }
         const buf = await file.arrayBuffer()
         let pdf
-        try {
-          pdf = await pdfjsLib.getDocument({ data: buf }).promise
-        } catch (err) {
+        try { pdf = await pdfjsLib.getDocument({ data: buf }).promise }
+        catch (err) {
           if (err.message && err.message.includes('API version')) {
             setStatus('Worker mismatch, retrying...')
             pdfjsLib.GlobalWorkerOptions.workerSrc = ''
@@ -524,15 +801,10 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         let hasTable = false
         for (let i = 1; i <= pdf.numPages; i++) {
           setProgress(Math.round((i / pdf.numPages) * 70))
-          setStatus(`Reading PDF page ${i}/${pdf.numPages} — detecting BOQ tables...`)
+          setStatus(`Page ${i}/${pdf.numPages} — detecting tables & fixing errors...`)
           const page = await pdf.getPage(i)
           const content = await page.getTextContent()
-          const items = content.items.map(item => ({
-            str: item.str,
-            x: item.transform[4],
-            y: item.transform[5],
-            width: item.width
-          })).filter(it => it.str.trim())
+          const items = content.items.map(item => ({ str: item.str, x: item.transform[4], y: item.transform[5], width: item.width })).filter(it => it.str.trim())
           items.sort((a, b) => b.y - a.y || a.x - b.x)
           let rows = []
           let currentRow = []
@@ -558,21 +830,17 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           fullText += pageText + '\n'
         }
         setProgress(90)
+        const blocks = detectTableBlocks(fullText)
         const boq = parseBOQ(fullText)
         setIsBOQ(boq.isBOQ)
-        if (boq.isBOQ) {
-          setBoqData(boq)
-          setHasTables(true)
-          setStatus(`BOQ detected! ${boq.sections.length} sections, ${boq.sections.reduce((a,s)=>a+s.rows.length,0)} items`)
-        } else {
-          setHasTables(hasTable || detectTablesInText(fullText))
-        }
+        if (boq.isBOQ) { setBoqData(boq); setHasTables(true); setStatus(`BOQ detected! ${boq.sections.length} sections, ${boq.sections.reduce((a,s)=>a+s.rows.length,0)} items — errors fixed`) }
+        else { setHasTables(hasTable || blocks.some(b=>b.type==='table')); setStatus(hasTable ? `Tables detected! ${blocks.filter(b=>b.type==='table').length} tables — auto-fixing...` : `Text detected — no tables`) }
         setExtractedHtml('')
         setProgress(100)
         return fullText
       }
       if (ext === 'docx' || type.includes('officedocument.wordprocessingml')) {
-        setStatus('Extracting Word doc with tables (mammoth)...')
+        setStatus('Extracting Word doc — detecting tables & fixing...')
         const mammoth = await import('mammoth')
         const buf = await file.arrayBuffer()
         const htmlResult = await mammoth.convertToHtml({ arrayBuffer: buf })
@@ -580,8 +848,10 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         const hasTable = htmlResult.value.includes('<table')
         setHasTables(hasTable)
         setExtractedHtml(hasTable ? htmlResult.value : '')
+        const blocks = detectTableBlocks(textResult.value)
         const boq = parseBOQ(textResult.value)
         if (boq.isBOQ) { setIsBOQ(true); setBoqData(boq) }
+        else if (blocks.some(b=>b.type==='table')) setHasTables(true)
         setProgress(100)
         return textResult.value
       }
@@ -597,10 +867,10 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           const boq = parseBOQ(result.value)
           if (boq.isBOQ) { setIsBOQ(true); setBoqData(boq) }
           return result.value
-        } catch { return await file.text().catch(() => 'Could not extract .doc - please save as .docx') }
+        } catch { return await file.text().catch(() => 'Could not extract .doc') }
       }
       if (type.startsWith('image/') || ['png','jpg','jpeg','webp','bmp'].includes(ext)) {
-        setStatus('OCR on scanned BOQ — detecting tables... (10-20s)')
+        setStatus('OCR scanning — detecting tables & fixing errors...')
         setProgress(20)
         const { createWorker } = await import('tesseract.js')
         const worker = await createWorker('eng', 1, {
@@ -614,10 +884,11 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         const { data } = await worker.recognize(file)
         await worker.terminate()
         setProgress(90)
+        const blocks = detectTableBlocks(data.text)
         const boq = parseBOQ(data.text)
         setIsBOQ(boq.isBOQ)
         if (boq.isBOQ) setBoqData(boq)
-        setHasTables(detectTablesInText(data.text) || boq.isBOQ)
+        setHasTables(blocks.some(b=>b.type==='table') || boq.isBOQ)
         setExtractedHtml('')
         setProgress(100)
         return data.text
@@ -637,7 +908,6 @@ function ImportDocModal({ open, onClose, onExtracted }) {
     try {
       const text = await extractText(file)
       setExtracted(text)
-      if (!isBOQ) setStatus(`Extracted ${text.length} chars${hasTables ? ' — tables detected!' : ''} from ${file.name}`)
     } catch (err) { setStatus('Failed: ' + err.message) }
   }
 
@@ -647,11 +917,11 @@ function ImportDocModal({ open, onClose, onExtracted }) {
 
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', padding: 20, background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(10px)' }}>
-      <div className="glass-strong" style={{ width: '100%', maxWidth: 850, borderRadius: 24, padding: 24, maxHeight: '92vh', overflowY: 'auto' }}>
+      <div className="glass-strong" style={{ width: '100%', maxWidth: 900, borderRadius: 24, padding: 24, maxHeight: '92vh', overflowY: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div>
-            <h3 style={{ fontSize: 19 }}>Import Messy Document → Professional Letterhead</h3>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>BOQ auto-format like your example HTML • Tables, bullets, paragraphs fine-tuned</div>
+            <h3 style={{ fontSize: 19 }}>Smart Import — Auto-Detects Tables & Fixes Errors</h3>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>Knows difference: text with tables vs text without • BOQ, invoices, estimates</div>
           </div>
           <button className="btn-ghost" onClick={onClose} style={{ padding: '6px 12px' }}>✕ Close</button>
         </div>
@@ -663,24 +933,19 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           onClick={() => fileRef.current?.click()}
           style={{
             border: `2px dashed ${dragOver ? 'var(--gold)' : 'var(--border-strong)'}`,
-            borderRadius: 16,
-            padding: 28,
-            textAlign: 'center',
+            borderRadius: 16, padding: 28, textAlign: 'center',
             background: dragOver ? 'rgba(201,162,39,0.08)' : 'var(--surface)',
-            cursor: 'pointer',
-            transition: 'all 0.2s'
+            cursor: 'pointer', transition: 'all 0.2s'
           }}
         >
-          <div style={{ fontSize: 36, marginBottom: 8 }}>📄📊✨</div>
-          <div style={{ fontWeight: 800, fontSize: 15 }}>Drop messy BOQ PDF like "bill of Quantity for a Luxury Duplex-1.pdf"</div>
+          <div style={{ fontSize: 36, marginBottom: 8 }}>📄📊🧠✨</div>
+          <div style={{ fontWeight: 800, fontSize: 15 }}>Drop any document — messy PDF, Word, scan</div>
           <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 6, lineHeight: 1.4 }}>
-            <strong>Will auto-format to look like Luxury_Duplex_BOQ_Formatted.html</strong><br/>
-            Detects sections, tables (Description, Unit, Qty, Rate, Amount), subtotals, grand total<br/>
+            <strong>Auto-detects:</strong> tables with errors, BOQ, lists, paragraphs<br/>
+            <strong>Auto-fixes:</strong> misaligned columns, missing headers, merged cells, OCR errors (m², m³), empty rows<br/>
             .txt, .pdf, .docx, .png, .jpg — max 20MB
           </div>
-          <div style={{ marginTop: 14 }}>
-            <span className="btn-gold" style={{ padding: '10px 18px', fontSize: 13 }}>Browse Files</span>
-          </div>
+          <div style={{ marginTop: 14 }}><span className="btn-gold" style={{ padding: '10px 18px', fontSize: 13 }}>Browse Files</span></div>
           <input ref={fileRef} type="file" accept=".txt,.pdf,.docx,.doc,.png,.jpg,.jpeg,.webp" style={{ display: 'none' }} onChange={e => handleFiles(e.target.files)} />
         </div>
 
@@ -689,14 +954,23 @@ function ImportDocModal({ open, onClose, onExtracted }) {
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, alignItems: 'center' }}>
               <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 {status}
-                {hasTables && <span style={{ background: 'var(--gold)', color: '#000', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>TABLES</span>}
-                {isBOQ && <span style={{ background: '#111', color: '#D4AF37', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>BOQ MODE — LIKE EXAMPLE HTML</span>}
+                {hasTables && <span style={{ background: 'var(--gold)', color: '#000', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>TABLES DETECTED</span>}
+                {isBOQ && <span style={{ background: '#111', color: '#D4AF37', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>BOQ MODE</span>}
+                {!hasTables && !isBOQ && extracted && <span style={{ background: '#e8f5e9', color: '#2e7d32', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>TEXT ONLY</span>}
               </span>
               <span style={{ fontWeight: 700 }}>{progress}%</span>
             </div>
             <div style={{ height: 6, background: 'var(--border)', borderRadius: 999, overflow: 'hidden' }}>
-              <div style={{ width: `${progress}%`, height: '100%', background: isBOQ ? 'linear-gradient(90deg, #111, #C9A227)' : hasTables ? 'linear-gradient(90deg, var(--gold), #111)' : 'var(--gold)', transition: 'width 0.3s' }} />
+              <div style={{ width: `${progress}%`, height: '100%', background: isBOQ ? 'linear-gradient(90deg, #111, #C9A227)' : hasTables ? 'linear-gradient(90deg, var(--gold), #111)' : '#4caf50', transition: 'width 0.3s' }} />
             </div>
+            {tableStats && (
+              <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-secondary)', display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                <span>📊 Tables: {tableStats.tables}</span>
+                <span>📝 Rows: {tableStats.rows}</span>
+                <span>🔧 Fixes: {tableStats.fixes?.length || 0}</span>
+                {tableStats.fixes?.slice(0,3).map((f,i)=><span key={i} style={{ background: 'rgba(201,162,39,0.1)', padding: '2px 6px', borderRadius: 6 }}>{f}</span>)}
+              </div>
+            )}
           </div>
         )}
 
@@ -704,22 +978,22 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           <div style={{ marginTop: 18 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
               <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)' }}>
-                {isBOQ ? `BOQ DETECTED — ${boqData?.sections.length} SECTIONS, ${boqData?.sections.reduce((a,s)=>a+s.rows.length,0)} ITEMS` : hasTables ? 'WITH TABLES & LISTS' : 'TEXT'} — AUTO-IMPROVED TO PROFESSIONAL
+                {isBOQ ? `BOQ — ${boqData?.sections.length} SECTIONS` : hasTables ? `WITH TABLES — ${tableStats?.tables || 0} TABLES AUTO-FIXED` : 'TEXT ONLY — NO TABLES'} — PROFESSIONAL
               </label>
-              <span style={{ fontSize: 11, color: isBOQ ? '#111' : hasTables ? 'var(--gold)' : 'var(--text-tertiary)', fontWeight: 800, background: isBOQ ? '#D4AF37' : 'transparent', padding: isBOQ ? '2px 8px' : '0', borderRadius: 999 }}>
-                {isBOQ ? '📊 Will look like your formatted HTML example' : hasTables ? '📊 Tables formatted' : '✨ Paragraphs & bullets added'}
+              <span style={{ fontSize: 11, color: isBOQ ? '#111' : hasTables ? 'var(--gold)' : '#2e7d32', fontWeight: 800, background: isBOQ ? '#D4AF37' : hasTables ? 'rgba(201,162,39,0.15)' : '#e8f5e9', padding: '2px 8px', borderRadius: 999 }}>
+                {isBOQ ? '📊 BOQ formatted' : hasTables ? '🧠 Tables fixed & styled' : '📝 Paragraphs & bullets'}
               </span>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
               <div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>MESSY RAW (from PDF 1)</div>
-                <div className="input-glass" style={{ maxHeight: 260, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 11, lineHeight: 1.4 }}>{extracted.slice(0, 3500)}{extracted.length > 3500 ? '\n... (truncated)' : ''}</div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>MESSY RAW INPUT</div>
+                <div className="input-glass" style={{ maxHeight: 280, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 11, lineHeight: 1.4 }}>{extracted.slice(0, 4000)}{extracted.length > 4000 ? '\n... (truncated)' : ''}</div>
               </div>
               <div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PROFESSIONAL FORMATTED (like HTML 2)</div>
-                <div className="glass" style={{ maxHeight: 260, overflowY: 'auto', padding: 8, borderRadius: 12, background: '#fff' }}>
-                  <div style={{ transform: 'scale(0.6)', transformOrigin: 'top left', width: '166%', fontSize: 12 }} dangerouslySetInnerHTML={{ __html: isBOQ && boqData ? formatBOQToHtml(boqData) : formatToHtml(extracted, extractedHtml).slice(0, 10000) }} />
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PROFESSIONAL FIXED OUTPUT</div>
+                <div className="glass" style={{ maxHeight: 280, overflowY: 'auto', padding: 8, borderRadius: 12, background: '#fff' }}>
+                  <div style={{ transform: 'scale(0.62)', transformOrigin: 'top left', width: '161%', fontSize: 12 }} dangerouslySetInnerHTML={{ __html: isBOQ && boqData ? formatBOQToHtml(boqData) : formatToHtml(extracted, extractedHtml).slice(0, 12000) }} />
                 </div>
               </div>
             </div>
@@ -728,12 +1002,9 @@ function ImportDocModal({ open, onClose, onExtracted }) {
               <button className="btn-gold" onClick={() => {
                 if (isBOQ && boqData) {
                   const fullHtml = formatBOQToHtml(boqData)
-                  // For letterhead, we need to extract body part and put into letter
-                  // For BOQ, we create a new window with formatted HTML or put as letter body
                   const blob = new Blob([fullHtml], { type: 'text/html' })
                   const url = URL.createObjectURL(blob)
                   window.open(url, '_blank')
-                  // Also put table version into letter body for PDF export on letterhead
                   const tableHtml = boqData.sections.map(sec => {
                     let t = `<p><strong>${sec.number} — ${sec.title}</strong></p><table class="letter-table"><thead><tr><th>Description</th><th>Unit</th><th>Qty</th><th>Rate (₦)</th><th>Amount (₦)</th></tr></thead><tbody>`
                     sec.rows.forEach(r => { t += `<tr><td>${r.description}</td><td>${r.unit}</td><td>${r.qty}</td><td>${r.rate}</td><td>${r.amount}</td></tr>` })
@@ -747,7 +1018,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
                   onExtracted(html, extracted)
                 }
                 onClose()
-              }}>✨ {isBOQ ? 'Format Like Example HTML (BOQ) & Put on Letterhead' : 'Auto-Improve & Put on Letterhead'}</button>
+              }}>✨ {isBOQ ? 'Format BOQ & Put on Letterhead' : hasTables ? 'Fix Tables & Put on Letterhead' : 'Format Text & Put on Letterhead'}</button>
               
               {isBOQ && (
                 <button className="btn-ghost" style={{ fontSize: 12, background: '#111', color: '#D4AF37' }} onClick={() => {
@@ -758,15 +1029,15 @@ function ImportDocModal({ open, onClose, onExtracted }) {
                   a.href = url
                   a.download = `BOQ_Formatted_${new Date().toISOString().slice(0,10)}.html`
                   a.click()
-                }}>⬇ Download Formatted HTML (like doc 2)</button>
+                }}>⬇ Download HTML</button>
               )}
 
-              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => { setExtracted(''); setExtractedHtml(''); setStatus(''); setProgress(0); setHasTables(false); setIsBOQ(false); setBoqData(null) }}>Clear</button>
+              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => { setExtracted(''); setExtractedHtml(''); setStatus(''); setProgress(0); setHasTables(false); setIsBOQ(false); setBoqData(null); setTableStats(null) }}>Clear</button>
             </div>
 
             <div className="glass" style={{ marginTop: 14, padding: 12, borderRadius: 12, fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-              <strong>🧠 BOQ Smart Format:</strong> {isBOQ ? `Detected ${boqData?.sections.length} sections like your example. Each section gets black header + gold, table with Description/Unit/Qty/Rate/Amount, subtotal row, grand total bar, notes, and CEO sign-off — exactly like Luxury_Duplex_BOQ_Formatted.html. Even if PDF 1 was messy, it fine-tunes spacing, adds paragraphs, bullets, and professional tables.` : 'No BOQ detected — will format as paragraphs + bullet lists + tables.'}
-              <br/>Date is on right side. Content flows across pages with Letter 1 on page 1, Letter 2 on rest.
+              <strong>🧠 Smart Engine:</strong> {isBOQ ? `BOQ detected — sections, tables, subtotals auto-fixed.` : hasTables ? `Detected ${tableStats?.tables||0} tables, ${tableStats?.rows||0} rows. Fixes: ${tableStats?.fixes?.join(', ')||'none'}. Knows difference between text with tables (creates professional gold/black tables) and text without (paragraphs + bullets).` : 'No tables detected — formatted as professional paragraphs, headings, bullet/numbered lists.'}
+              <br/>Date on right with professional space. No text cut — moves to next page if needed.
             </div>
           </div>
         )}

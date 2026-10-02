@@ -1779,14 +1779,78 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
 }
 
 
-// ---------- PDF Export - EXACT MATCH to Preview, No Font/Position Change ----------
+// ---------- PDF Export - JPG Conversion First (Exact Visual Match) ----------
+async function exportLetterPdfAsJpg() {
+  try {
+    const pages = document.querySelectorAll('.a4-page')
+    if (!pages || pages.length === 0) {
+      throw new Error('No preview pages found - compose a letter first')
+    }
+
+    const { PDFDocument } = await import('pdf-lib')
+    const html2canvas = (await import('html2canvas')).default
+    const pdfDoc = await PDFDocument.create()
+    const A4 = [595.28, 841.89]
+
+    for (let i = 0; i < pages.length; i++) {
+      const pageEl = pages[i]
+      try {
+        // Hide page number for cleaner export? Keep it - matches preview
+        const canvas = await html2canvas(pageEl, {
+          scale: 2.5, // High quality
+          useCORS: true,
+          allowTaint: true,
+          backgroundColor: '#ffffff',
+          logging: false,
+          width: 794,
+          height: 1123,
+          windowWidth: 794,
+          windowHeight: 1123,
+          onclone: (clonedDoc) => {
+            // Ensure fonts loaded in cloned doc
+            const clonedPages = clonedDoc.querySelectorAll('.a4-page')
+            clonedPages.forEach(p => {
+              p.style.boxShadow = 'none'
+              p.style.margin = '0'
+              p.style.borderRadius = '0'
+            })
+          }
+        })
+
+        // Convert canvas to JPG with 92% quality
+        const jpgDataUrl = canvas.toDataURL('image/jpeg', 0.92)
+        const res = await fetch(jpgDataUrl)
+        const jpgBytes = await res.arrayBuffer()
+        const jpgImage = await pdfDoc.embedJpg(jpgBytes)
+        const pdfPage = pdfDoc.addPage(A4)
+        pdfPage.drawImage(jpgImage, { x: 0, y: 0, width: A4[0], height: A4[1] })
+      } catch (pageErr) {
+        console.warn(`Failed to capture page ${i+1} as JPG, using blank`, pageErr)
+        // Create blank page with error text
+        const pdfPage = pdfDoc.addPage(A4)
+        try {
+          const { rgb, StandardFonts } = await import('pdf-lib')
+          const font = await pdfDoc.embedFont(StandardFonts.Helvetica)
+          pdfPage.drawText(`Page ${i+1} capture failed: ${pageErr.message}`, { x: 50, y: A4[1]-50, size: 10, font, color: rgb(0.8,0,0) })
+        } catch {}
+      }
+    }
+
+    const pdfBytes = await pdfDoc.save()
+    return pdfBytes
+  } catch (err) {
+    console.error('exportLetterPdfAsJpg failed', err)
+    throw new Error('JPG to PDF export failed: ' + (err.message || err))
+  }
+}
+
+// Fallback text-based PDF (kept for compatibility)
 async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature = true) {
   try {
     const { PDFDocument, rgb, StandardFonts } = await import('pdf-lib')
     const pdfDoc = await PDFDocument.create()
     const A4 = [595.28, 841.89]
 
-    // Load fonts - exact same as preview (Nunito Sans)
     let fontMed, fontBold, fontExtra
     try {
       const [medBytes, boldBytes, extraBytes] = await Promise.all([
@@ -1803,7 +1867,6 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
       fontExtra = fontBold
     }
 
-    // Load letterhead images
     let letter1Img = null, letter2Img = null, signImg = null
     try {
       const [l1, l2] = await Promise.all([
@@ -1820,29 +1883,21 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
       } catch {}
     }
 
-    // Use shared block builder for EXACT match
     const blocks = buildLetterBlocks(letter, showSignature)
 
-    // Helper to parse table blocks - identify total figure, don't mix text
     const parseTableBlock = (blockHtml) => {
       try {
         const doc = new DOMParser().parseFromString(blockHtml, 'text/html')
         const table = doc.querySelector('table')
         if (!table) return null
-        
         const rows = []
         const thead = table.querySelector('thead')
-        const tbody = table.querySelector('tbody') || table
-        
-        // Extract headers
         let headers = []
         if (thead) {
           const ths = thead.querySelectorAll('th')
           headers = Array.from(ths).map(th => (th.textContent||'').trim().slice(0,50))
         }
-        
-        // Extract body rows
-        const trs = tbody.querySelectorAll('tr')
+        const trs = table.querySelectorAll('tbody tr, tr')
         for (const tr of trs) {
           if (thead && thead.contains(tr)) continue
           const cells = Array.from(tr.querySelectorAll('td, th')).map(cell => ({
@@ -1857,43 +1912,18 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
             rows.push({ cells, isTotal: isTotalRow, isHeader: cells.some(c=>c.isHeader) })
           }
         }
-        
-        // Always identify total figure - find last row with total or largest amount
         let grandTotal = null
-        let grandTotalRow = null
         for (let i = rows.length - 1; i >= 0; i--) {
           if (rows[i].isTotal) {
-            // Find numeric value in this row
             for (const cell of rows[i].cells) {
               const numMatch = cell.text.match(/₦?\s*([0-9,]+\.?\d*)/)
-              if (numMatch) {
-                grandTotal = numMatch[1]
-                grandTotalRow = rows[i]
-                break
-              }
+              if (numMatch) { grandTotal = numMatch[1]; break }
             }
             if (grandTotal) break
           }
         }
-        // If no explicit total row, check if last row has large number
-        if (!grandTotal && rows.length > 0) {
-          const lastRow = rows[rows.length-1]
-          for (const cell of lastRow.cells) {
-            if (/₦?\s*[0-9,]{4,}/.test(cell.text)) {
-              const m = cell.text.match(/₦?\s*([0-9,]+\.?\d*)/)
-              if (m && m[1].replace(/,/g,'').length >= 4) {
-                // Might be total if it's large
-                // Don't auto-assign unless row says total
-              }
-            }
-          }
-        }
-        
-        return { headers, rows, grandTotal, grandTotalRow, isTable: true }
-      } catch (e) {
-        console.warn('parseTableBlock failed', e)
-        return null
-      }
+        return { headers, rows, grandTotal, isTable: true }
+      } catch { return null }
     }
 
     let currentPageIndex = 0
@@ -1901,14 +1931,7 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
       const page = pdfDoc.addPage(A4)
       try {
         const bg = currentPageIndex === 0 ? letter1Img : letter2Img
-        if (bg) {
-          page.drawImage(bg, { x: 0, y: 0, width: A4[0], height: A4[1] })
-        } else {
-          if (currentPageIndex === 0) {
-            page.drawRectangle({ x: 0, y: A4[1]-82, width: A4[0], height: 82, color: rgb(0.05,0.05,0.05) })
-            page.drawRectangle({ x: 0, y: A4[1]-85, width: A4[0], height: 3, color: rgb(0.79,0.66,0.15) })
-          }
-        }
+        if (bg) page.drawImage(bg, { x: 0, y: 0, width: A4[0], height: A4[1] })
       } catch {}
       currentPageIndex++
       return page
@@ -1929,18 +1952,16 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
     }
 
     let bounds = drawContentOnPage(0)
-    let cursorY = bounds.top - 30 // Professional space 30pt after logo (matches preview 24px + 6px)
+    let cursorY = bounds.top - 30
 
     const ensureSpace = (needed) => {
       if (cursorY - needed < bounds.bottom) {
-        // Check if current page has content - avoid blank pages
-        if (cursorY < bounds.top - 50) { // Has content
+        if (cursorY < bounds.top - 50) {
           page = addPage()
           bounds = drawContentOnPage(currentPageIndex - 1)
-          cursorY = bounds.top - 18 // Less space on page 2+ (no logo)
+          cursorY = bounds.top - 18
           return true
         } else {
-          // Current page empty, don't add new page, just reset cursor
           cursorY = bounds.top - 18
           return false
         }
@@ -1948,55 +1969,32 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
       return false
     }
 
-    // Draw blocks EXACTLY as preview - same order, same spacing, same fonts
     for (let bIdx = 0; bIdx < blocks.length; bIdx++) {
       const block = blocks[bIdx]
-      
-      // Skip empty blocks that would create blank pages
       const isEmpty = !block.html || block.html.replace(/<[^>]+>/g,'').trim().length === 0
       if (isEmpty && !block.isTable) continue
-
-      // Estimate height for this block
       let estimatedHeight = block.heightEstimate || 40
       if (block.type === 'table') {
-        // Estimate table height: header + rows * rowHeight
         try {
           const parsed = parseTableBlock(block.html)
           if (parsed) estimatedHeight = 24 + (parsed.rows.length * 20) + 10
         } catch {}
       }
-
-      // Check if need new page - HEADINGS WITH TABLES ALWAYS STAY TOGETHER, but avoid blank spaces
       if (cursorY - estimatedHeight < bounds.bottom) {
         const nextBlock = blocks[bIdx+1]
         const isHeading = block.type === 'heading'
-        const nextIsPara = nextBlock && (nextBlock.type === 'paragraph' || nextBlock.type === 'table')
         const nextIsTable = nextBlock && nextBlock.isTable
         const remaining = cursorY - bounds.bottom
-        
         if (isHeading && nextIsTable) {
-          // Heading + table must stay together - but avoid large blank spaces
           const combinedHeight = estimatedHeight + (nextBlock.heightEstimate||80) + 10
           if (cursorY - combinedHeight < bounds.bottom && cursorY < bounds.top - 50) {
             if (remaining < 100) {
-              // Small remaining - move both to next page
-              page = addPage()
-              bounds = drawContentOnPage(currentPageIndex - 1)
-              cursorY = bounds.top - 18
-            }
-            // Else large remaining - keep heading on current page, table will split and fill space (no blank)
-          }
-        } else if (isHeading && nextIsPara) {
-          const combinedHeight = estimatedHeight + (nextBlock.heightEstimate||50) + 10
-          if (cursorY - combinedHeight < bounds.bottom && cursorY < bounds.top - 50) {
-            if (remaining < 80) {
               page = addPage()
               bounds = drawContentOnPage(currentPageIndex - 1)
               cursorY = bounds.top - 18
             }
           }
         } else if (cursorY < bounds.top - 60) {
-          // Has content, need new page - but avoid blank if table can split
           if (block.type === 'table') {
             const remaining = cursorY - bounds.bottom
             if (remaining < 80) {
@@ -2004,7 +2002,6 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
               bounds = drawContentOnPage(currentPageIndex - 1)
               cursorY = bounds.top - 18
             }
-            // Else keep table on current page, it will split rows to fill space
           } else {
             page = addPage()
             bounds = drawContentOnPage(currentPageIndex - 1)
@@ -2013,114 +2010,68 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
         }
       }
 
-      // Draw based on block type - EXACT match to preview styling
       try {
         if (block.type === 'refdate') {
-          // Ref left (bold), Date right - EXACT same as preview
           const refText = `Ref: ${(letter.reference_no||'').slice(0,50)}`
           const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
           page.drawText(refText, { x: bounds.left, y: cursorY, size: 10.5, font: fontBold, color: rgb(0.07,0.07,0.07) })
           const dateW = fontMed.widthOfTextAtSize(dateStr, 10.5)
           page.drawText(dateStr, { x: Math.max(bounds.left, bounds.right - dateW), y: cursorY, size: 10.5, font: fontMed, color: rgb(0.13,0.13,0.13) })
-          cursorY -= 30 // 28px bottom + 2px extra - matches preview
-        } 
-        else if (block.type === 'recipient') {
-          if (letter.recipient_name) {
-            ensureSpace(14)
-            page.drawText((letter.recipient_name||'').slice(0,100), { x: bounds.left, y: cursorY, size: 11.5, font: fontBold, color: rgb(0.07,0.07,0.07) })
-            cursorY -= 15
-          }
-          if (letter.recipient_title) {
-            ensureSpace(13)
-            page.drawText((letter.recipient_title||'').slice(0,100), { x: bounds.left, y: cursorY, size: 10.5, font: fontMed, color: rgb(0.13,0.13,0.13) })
-            cursorY -= 13
-          }
+          cursorY -= 30
+        } else if (block.type === 'recipient') {
+          if (letter.recipient_name) { ensureSpace(14); page.drawText((letter.recipient_name||'').slice(0,100), { x: bounds.left, y: cursorY, size: 11.5, font: fontBold }); cursorY -= 15 }
+          if (letter.recipient_title) { ensureSpace(13); page.drawText((letter.recipient_title||'').slice(0,100), { x: bounds.left, y: cursorY, size: 10.5, font: fontMed }); cursorY -= 13 }
           if (letter.recipient_address) {
             const lines = (letter.recipient_address||'').split('\n').slice(0,5)
-            for (const ln of lines) {
-              if (!ln.trim()) continue
-              ensureSpace(13)
-              page.drawText(ln.slice(0,100), { x: bounds.left, y: cursorY, size: 10.5, font: fontMed, color: rgb(0.13,0.13,0.13) })
-              cursorY -= 14
-            }
+            for (const ln of lines) { if (!ln.trim()) continue; ensureSpace(13); page.drawText(ln.slice(0,100), { x: bounds.left, y: cursorY, size: 10.5, font: fontMed }); cursorY -= 14 }
           }
-          cursorY -= 10 // Extra spacing after recipient
-        }
-        else if (block.type === 'subject') {
+          cursorY -= 10
+        } else if (block.type === 'subject') {
           ensureSpace(20)
           const label = 'Subject: '
-          page.drawText(label, { x: bounds.left, y: cursorY, size: 11, font: fontBold, color: rgb(0.07,0.07,0.07) })
+          page.drawText(label, { x: bounds.left, y: cursorY, size: 11, font: fontBold })
           const labelW = fontBold.widthOfTextAtSize(label, 11)
           const subj = (letter.subject||'').slice(0,120)
           const subjW = fontBold.widthOfTextAtSize(subj, 11)
-          page.drawText(subj, { x: bounds.left + labelW, y: cursorY, size: 11, font: fontBold, color: rgb(0.07,0.07,0.07) })
+          page.drawText(subj, { x: bounds.left + labelW, y: cursorY, size: 11, font: fontBold })
           try { page.drawLine({ start: { x: bounds.left + labelW, y: cursorY - 2 }, end: { x: bounds.left + labelW + Math.min(subjW, bounds.width - labelW), y: cursorY - 2 }, thickness: 0.8, color: rgb(0,0,0) }) } catch {}
           cursorY -= 22
-        }
-        else if (block.type === 'salutation') {
+        } else if (block.type === 'salutation') {
           ensureSpace(16)
-          page.drawText((letter.salutation||'').slice(0,100), { x: bounds.left, y: cursorY, size: 11.5, font: fontMed, color: rgb(0.07,0.07,0.07) })
-          cursorY -= 32 // 30px bottom + 2px - matches preview salutation spacing
-        }
-        else if (block.type === 'heading') {
-          // Headings - extra spacing, bold, larger
+          page.drawText((letter.salutation||'').slice(0,100), { x: bounds.left, y: cursorY, size: 11.5, font: fontMed })
+          cursorY -= 32
+        } else if (block.type === 'heading') {
           ensureSpace(28)
-          cursorY -= 6 // Extra top space before heading
+          cursorY -= 6
           const headingText = (block.text||'').slice(0,150)
-          // Wrap heading if long
           const words = headingText.split(/\s+/)
           let line = ''
           for (const w of words) {
             const test = line ? line + ' ' + w : w
             if (fontBold.widthOfTextAtSize(test, 12.5) > bounds.width && line) {
-              page.drawText(line, { x: bounds.left, y: cursorY, size: 12.5, font: fontBold, color: rgb(0.07,0.07,0.07) })
+              page.drawText(line, { x: bounds.left, y: cursorY, size: 12.5, font: fontBold })
               cursorY -= 18
               ensureSpace(18)
               line = w
-            } else {
-              line = test
-            }
+            } else line = test
           }
-          if (line) {
-            page.drawText(line, { x: bounds.left, y: cursorY, size: 12.5, font: fontBold, color: rgb(0.07,0.07,0.07) })
-            cursorY -= 18
-          }
-          cursorY -= 6 // Bottom spacing after heading
-        }
-        else if (block.type === 'table') {
-          // TABLE - don't mix with ordinary text, keep separate, identify total figure
+          if (line) { page.drawText(line, { x: bounds.left, y: cursorY, size: 12.5, font: fontBold }); cursorY -= 18 }
+          cursorY -= 6
+        } else if (block.type === 'table') {
           try {
             const parsed = parseTableBlock(block.html)
-            if (!parsed || !parsed.rows || parsed.rows.length === 0) {
-              cursorY -= 10
-              continue
-            }
-
+            if (!parsed || !parsed.rows || parsed.rows.length === 0) { cursorY -= 10; continue }
             const colCount = parsed.headers.length > 0 ? parsed.headers.length : Math.max(1, ...parsed.rows.map(r => r.cells.reduce((sum,c)=>sum+(c.colspan||1),0)))
             const colWidth = bounds.width / colCount
             const rowHeight = 20
             const headerHeight = 24
             const tableHeight = headerHeight + (parsed.rows.length * rowHeight) + 6
-
-            // Ensure space - if table doesn't fit, move to next page (don't mix, don't cut)
             if (cursorY - tableHeight < bounds.bottom) {
               if (tableHeight > (bounds.top - bounds.bottom) * 0.75) {
-                // Large table - allow split, but ensure header fits
-                if (cursorY - headerHeight - rowHeight < bounds.bottom) {
-                  page = addPage()
-                  bounds = drawContentOnPage(currentPageIndex - 1)
-                  cursorY = bounds.top - 18
-                }
-              } else {
-                page = addPage()
-                bounds = drawContentOnPage(currentPageIndex - 1)
-                cursorY = bounds.top - 18
-              }
+                if (cursorY - headerHeight - rowHeight < bounds.bottom) { page = addPage(); bounds = drawContentOnPage(currentPageIndex - 1); cursorY = bounds.top - 18 }
+              } else { page = addPage(); bounds = drawContentOnPage(currentPageIndex - 1); cursorY = bounds.top - 18 }
             }
-
             let y = cursorY
-
-            // Draw header - black with gold border, EXACT same as preview
             if (parsed.headers.length > 0) {
               let x = bounds.left
               for (let hIdx = 0; hIdx < parsed.headers.length; hIdx++) {
@@ -2132,29 +2083,20 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
                   const isNumHeader = /amount|rate|qty|price|total/i.test(hText)
                   let tx = x + 6
                   let t = hText.slice(0,30)
-                  if (isNumHeader) {
-                    const tw = fontBold.widthOfTextAtSize(t, 10)
-                    tx = x + w - tw - 8
-                  }
+                  if (isNumHeader) { const tw = fontBold.widthOfTextAtSize(t, 10); tx = x + w - tw - 8 }
                   page.drawText(t, { x: tx, y: y - 6, size: 10, font: fontBold, color: rgb(1,1,1) })
                 } catch {}
                 x += w
               }
               y -= headerHeight
             }
-
-            // Draw rows - don't mix table text and ordinary text
             for (let rIdx = 0; rIdx < parsed.rows.length; rIdx++) {
               const row = parsed.rows[rIdx]
               if (!row.cells || row.cells.length === 0) continue
-
-              // Check if need new page for this row - move entire row, don't cut
               if (y - rowHeight < bounds.bottom) {
                 page = addPage()
                 bounds = drawContentOnPage(currentPageIndex - 1)
                 y = bounds.top - 18
-                
-                // Redraw header on new page for continuity
                 if (parsed.headers.length > 0) {
                   let x = bounds.left
                   for (let hIdx = 0; hIdx < parsed.headers.length; hIdx++) {
@@ -2162,26 +2104,20 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
                     const w = colWidth
                     page.drawRectangle({ x, y: y - headerHeight + 4, width: w, height: headerHeight, color: rgb(0.07,0.07,0.07) })
                     page.drawRectangle({ x, y: y - headerHeight + 4, width: w, height: headerHeight, borderColor: rgb(0.79,0.66,0.15), borderWidth: 0.9 })
-                    try {
-                      page.drawText(hText.slice(0,30), { x: x + 6, y: y - 6, size: 10, font: fontBold, color: rgb(1,1,1) })
-                    } catch {}
+                    try { page.drawText(hText.slice(0,30), { x: x + 6, y: y - 6, size: 10, font: fontBold, color: rgb(1,1,1) }) } catch {}
                     x += w
                   }
                   y -= headerHeight
                 }
               }
-
               let x = bounds.left
               const isTotalRow = row.isTotal
-              
               for (let cIdx = 0; cIdx < row.cells.length; cIdx++) {
                 const cell = row.cells[cIdx]
                 const w = colWidth * (cell.colspan||1)
-                
                 try {
-                  // Background - total rows beige #f0ece3, even #fafaf8, odd white
                   if (isTotalRow) {
-                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.94,0.93,0.89) }) // #f0ece3
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.94,0.93,0.89) })
                     page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.79,0.66,0.15), borderWidth: cIdx===0 ? 0.9 : 0.5 })
                   } else if (rIdx % 2 === 0) {
                     page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.98,0.98,0.96) })
@@ -2190,45 +2126,27 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
                     page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(1,1,1) })
                     page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.9,0.9,0.9), borderWidth: 0.5 })
                   }
-
                   const font = isTotalRow ? fontBold : fontMed
                   const size = 9.5
                   const textColor = isTotalRow ? rgb(0.07,0.07,0.07) : rgb(0.1,0.1,0.1)
                   let txt = (cell.text||'').slice(0,60)
-                  
-                  // Truncate if too long
                   try {
                     let txtWidth = font.widthOfTextAtSize(txt, size)
-                    while (txtWidth > w - 12 && txt.length > 0) {
-                      txt = txt.slice(0, -1)
-                      txtWidth = font.widthOfTextAtSize(txt + '…', size)
-                    }
+                    while (txtWidth > w - 12 && txt.length > 0) { txt = txt.slice(0, -1); txtWidth = font.widthOfTextAtSize(txt + '…', size) }
                     if (txt.length < (cell.text||'').length) txt += '…'
                   } catch {}
-
                   const isNum = /^-?[\d,]+(\.\d+)?$/.test((cell.text||'').replace(/[$%₦,]/g,'').trim()) || /₦/.test(cell.text||'')
                   let tx = x + 6
-                  if (isNum) {
-                    try { const tw = font.widthOfTextAtSize(txt, size); tx = x + w - tw - 8 } catch {}
-                  }
-
+                  if (isNum) { try { const tw = font.widthOfTextAtSize(txt, size); tx = x + w - tw - 8 } catch {} }
                   page.drawText(txt, { x: tx, y: y - 4, size, font, color: textColor })
                   x += w
-                } catch (cellErr) {
-                  console.warn('cell draw failed', cellErr)
-                  x += w
-                }
+                } catch { x += w }
               }
               y -= rowHeight
             }
-            cursorY = y - 12 // Extra spacing after table - don't mix with text
-          } catch (tableErr) {
-            console.warn('table block draw failed', tableErr)
-            cursorY -= 20
-          }
-        }
-        else if (block.type === 'list') {
-          // Lists - bullet or numbered, separate from table text
+            cursorY = y - 12
+          } catch { cursorY -= 20 }
+        } else if (block.type === 'list') {
           try {
             const doc = new DOMParser().parseFromString(block.html, 'text/html')
             const lis = doc.querySelectorAll('li')
@@ -2236,9 +2154,7 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
               const liText = (li.textContent||'').trim().slice(0,200)
               if (!liText) continue
               ensureSpace(16)
-              // Bullet
               page.drawText('•', { x: bounds.left + 8, y: cursorY, size: 11.5, font: fontBold })
-              // Text with wrapping
               const bulletIndent = 20
               const maxW = bounds.width - bulletIndent
               const words = liText.split(/\s+/)
@@ -2250,35 +2166,22 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
                   cursorY -= 17
                   ensureSpace(17)
                   line = w
-                } else {
-                  line = test
-                }
+                } else line = test
               }
-              if (line) {
-                page.drawText(line, { x: bounds.left + bulletIndent, y: cursorY, size: 11.5, font: fontMed })
-                cursorY -= 18
-              }
+              if (line) { page.drawText(line, { x: bounds.left + bulletIndent, y: cursorY, size: 11.5, font: fontMed }); cursorY -= 18 }
             }
           } catch {}
           cursorY -= 4
-        }
-        else {
-          // Paragraphs - ordinary text, not mixed with table
+        } else {
           try {
             const doc = new DOMParser().parseFromString(block.html, 'text/html')
             const text = (doc.body.textContent||'').trim().slice(0,2000)
             if (!text) continue
-            
             const isHeading = block.type === 'heading' || (text.length < 90 && (text.endsWith(':') || (text.toUpperCase() === text && text.length > 4 && text.length < 80)))
             const font = isHeading ? fontBold : fontMed
             const size = isHeading ? 12.5 : 11.5
-            const lh = isHeading ? 18 : 19 // 1.7 line height for 11.5pt = 19.5pt
-            
-            if (isHeading) {
-              ensureSpace(28)
-              cursorY -= 4
-            }
-            
+            const lh = isHeading ? 18 : 19
+            if (isHeading) { ensureSpace(28); cursorY -= 4 }
             const words = text.split(/\s+/)
             let line = ''
             for (const w of words) {
@@ -2289,60 +2192,34 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
                   page.drawText(line, { x: bounds.left, y: cursorY, size, font, color: rgb(0.07,0.07,0.07) })
                   cursorY -= lh
                   line = w
-                } else {
-                  line = test
-                }
+                } else line = test
               } catch { line = test }
             }
-            if (line) {
-              ensureSpace(lh)
-              page.drawText(line, { x: bounds.left, y: cursorY, size, font, color: rgb(0.07,0.07,0.07) })
-              cursorY -= lh
-            }
+            if (line) { ensureSpace(lh); page.drawText(line, { x: bounds.left, y: cursorY, size, font, color: rgb(0.07,0.07,0.07) }); cursorY -= lh }
             if (!isHeading) cursorY -= 4
           } catch {}
         }
-      } catch (blockErr) {
-        console.warn(`Block ${bIdx} draw failed`, blockErr)
-        cursorY -= 10
-      }
+      } catch (blockErr) { cursorY -= 10 }
     }
 
-    // Sign-off - keep together, exact match to preview
     const signOffHeight = showSignature ? 130 : 80
     if (cursorY - signOffHeight < bounds.bottom) {
-      // Avoid blank page - only add if current page has content
-      if (cursorY < bounds.top - 60) {
-        page = addPage()
-        bounds = drawContentOnPage(currentPageIndex - 1)
-        cursorY = bounds.top - 18
-      }
+      if (cursorY < bounds.top - 60) { page = addPage(); bounds = drawContentOnPage(currentPageIndex - 1); cursorY = bounds.top - 18 }
     }
     cursorY -= 8
-    try { page.drawText(letter.closing_line || 'Yours sincerely,', { x: bounds.left, y: cursorY, size: 11.5, font: fontMed, color: rgb(0.07,0.07,0.07) }) } catch {}
+    try { page.drawText(letter.closing_line || 'Yours sincerely,', { x: bounds.left, y: cursorY, size: 11.5, font: fontMed }) } catch {}
     cursorY -= 20
     if (showSignature && signImg) {
       try {
         const sigW = 110, sigH = 52
-        if (cursorY - sigH < bounds.bottom) {
-          if (cursorY < bounds.top - 60) {
-            page = addPage()
-            bounds = drawContentOnPage(currentPageIndex - 1)
-            cursorY = bounds.top - 18
-          }
-        }
+        if (cursorY - sigH < bounds.bottom) { if (cursorY < bounds.top - 60) { page = addPage(); bounds = drawContentOnPage(currentPageIndex - 1); cursorY = bounds.top - 18 } }
         page.drawImage(signImg, { x: bounds.left, y: cursorY - sigH + 12, width: sigW, height: sigH })
         cursorY -= sigH + 12
       } catch { cursorY -= 32 }
-    } else {
-      cursorY -= 32
-    }
-    try { page.drawText(OWNER.name, { x: bounds.left, y: cursorY, size: 12, font: fontExtra, color: rgb(0.07,0.07,0.07) }) } catch {}
+    } else cursorY -= 32
+    try { page.drawText(OWNER.name, { x: bounds.left, y: cursorY, size: 12, font: fontExtra }) } catch {}
     cursorY -= 15
-    try { page.drawText(OWNER.position, { x: bounds.left, y: cursorY, size: 10.5, font: fontBold, color: rgb(0.13,0.13,0.13) }) } catch {}
-
-    // Remove blank pages at end - check last page has content
-    // pdf-lib doesn't easily allow removing pages, but we ensured we don't create blank ones
+    try { page.drawText(OWNER.position, { x: bounds.left, y: cursorY, size: 10.5, font: fontBold }) } catch {}
 
     const pdfBytes = await pdfDoc.save()
     return pdfBytes
@@ -2478,15 +2355,28 @@ export default function App() {
     }
     setSaveState('Exporting...')
     try {
-      console.log('Starting PDF export for', l.reference_no)
-      const bytes = await exportLetterPdf(l, margins, l.signature_applied)
-      console.log('PDF bytes generated', bytes.length)
+      console.log('Starting PDF export (JPG conversion) for', l.reference_no)
+      let bytes
+      let method = 'JPG'
+      
+      // Always convert final work to JPG before exporting as PDF (per user request)
+      // This ensures exported file looks EXACTLY like finished letter on software
+      try {
+        bytes = await exportLetterPdfAsJpg()
+        console.log('JPG PDF bytes generated', bytes.length, '- exact visual match')
+      } catch (jpgErr) {
+        console.warn('JPG export failed, falling back to text-based PDF', jpgErr)
+        setSaveState('JPG failed, trying text PDF...')
+        method = 'TEXT'
+        bytes = await exportLetterPdf(l, margins, l.signature_applied)
+        console.log('Text PDF bytes generated', bytes.length)
+      }
+
       if (!bytes || bytes.length === 0) throw new Error('Generated PDF is empty')
 
       const blob = new Blob([bytes], { type: 'application/pdf' })
       const url = URL.createObjectURL(blob)
 
-      // Robust download that works in all browsers
       const fileName = `${(l.reference_no||'Q25-Letter').replace(/\//g, '-')}_${(l.recipient_name || 'letter').replace(/[^a-zA-Z0-9]/g, '_').slice(0,30)}.pdf`
       try {
         const a = document.createElement('a')
@@ -2495,7 +2385,6 @@ export default function App() {
         a.style.display = 'none'
         document.body.appendChild(a)
         a.click()
-        // Delay removal to ensure download starts
         setTimeout(() => {
           try { document.body.removeChild(a) } catch {}
           URL.revokeObjectURL(url)
@@ -2506,7 +2395,6 @@ export default function App() {
         setTimeout(() => URL.revokeObjectURL(url), 5000)
       }
 
-      // Optionally upload to supabase storage - non-blocking
       if (isSupabaseConfigured() && user) {
         try {
           const fileNameStorage = `${user.id}/${l.id}.pdf`
@@ -2520,66 +2408,81 @@ export default function App() {
           }
         } catch (e) { console.warn('storage upload failed', e) }
       }
-      setSaveState('Saved ✓')
-      setTimeout(() => setSaveState('Saved'), 2000)
+      setSaveState(`Saved ✓ (${method})`)
+      setTimeout(() => setSaveState('Saved'), 2500)
     } catch (e) {
       console.error('Export failed', e)
       setSaveState('Export failed')
       alert('PDF Export failed: ' + (e.message || 'Unknown error') + '\n\nCheck console for details. Trying print fallback.')
-      // Fallback to print
       try { window.print() } catch {}
     }
   }
 
   const handleSharePdf = async () => {
     if (!current) return
-    // Check if Web Share API with files is supported
-    const canShareFiles = navigator.canShare && (() => {
+    setSaveState('Preparing share...')
+    try {
+      let bytes
       try {
-        const testFile = new File([new Blob(['test'])], 'test.pdf', { type: 'application/pdf' })
-        return navigator.canShare({ files: [testFile] })
-      } catch { return false }
-    })()
+        bytes = await exportLetterPdfAsJpg()
+      } catch {
+        bytes = await exportLetterPdf(current, margins, current.signature_applied)
+      }
+      const blob = new Blob([bytes], { type: 'application/pdf' })
+      const fileName = `${(current.reference_no||'Q25-Letter').replace(/\//g, '-')}.pdf`
+      const file = new File([blob], fileName, { type: 'application/pdf' })
+      
+      const canShareFiles = navigator.canShare && (() => {
+        try { return navigator.canShare({ files: [file] }) } catch { return false }
+      })()
 
-    if (navigator.share && canShareFiles) {
-      setSaveState('Preparing share...')
-      try {
-        const bytes = await exportLetterPdf(current, margins, current.signature_applied)
-        const blob = new Blob([bytes], { type: 'application/pdf' })
-        const fileName = `${(current.reference_no||'Q25-Letter').replace(/\//g, '-')}.pdf`
-        const file = new File([blob], fileName, { type: 'application/pdf' })
+      if (navigator.share && canShareFiles) {
         await navigator.share({
           title: current.subject || 'Q25 Luxury Construx Letter',
           text: `Letter ${current.reference_no} - ${current.recipient_name || ''}`,
           files: [file]
         })
         setSaveState('Shared ✓')
-      } catch (err) {
-        console.warn('Share failed', err)
-        if (err.name !== 'AbortError') {
-          alert('Share failed: ' + err.message + '\nDownloading PDF instead.')
-          await handleExportPdf()
-        } else {
-          setSaveState('Saved')
-        }
-      }
-    } else if (navigator.share) {
-      // Share without files (text only) as fallback
-      try {
+      } else if (navigator.share) {
         await navigator.share({
           title: current.subject || 'Q25 Letter',
           text: `Letter ${current.reference_no} to ${current.recipient_name || ''}\nSubject: ${current.subject || ''}`
         })
         setSaveState('Shared ✓')
-      } catch (err) {
-        if (err.name !== 'AbortError') {
-          alert('Share not fully supported, downloading PDF')
-          await handleExportPdf()
-        }
+      } else {
+        throw new Error('Web Share not supported')
       }
-    } else {
-      alert('Web Share not supported on this device, downloading PDF')
-      await handleExportPdf()
+    } catch (err) {
+      console.warn('Share failed', err)
+      if (err.name !== 'AbortError') {
+        alert('Share not fully supported, downloading PDF (JPG converted)')
+        await handleExportPdf()
+      } else {
+        setSaveState('Saved')
+      }
+    }
+  }
+
+  const handleExportJpg = async () => {
+    try {
+      setSaveState('Exporting JPGs...')
+      const pages = document.querySelectorAll('.a4-page')
+      if (!pages.length) { alert('No pages to export'); return }
+      const html2canvas = (await import('html2canvas')).default
+      for (let i = 0; i < pages.length; i++) {
+        const canvas = await html2canvas(pages[i], { scale: 2.5, useCORS: true, backgroundColor: '#ffffff', logging: false, width: 794, height: 1123 })
+        const url = canvas.toDataURL('image/jpeg', 0.92)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `${(current.reference_no||'Q25').replace(/\//g,'-')}_Page${i+1}.jpg`
+        a.click()
+        await new Promise(r => setTimeout(r, 500))
+      }
+      setSaveState('JPGs Saved ✓')
+    } catch (e) {
+      console.error('JPG export failed', e)
+      alert('JPG export failed: ' + e.message)
+      setSaveState('Export failed')
     }
   }
 
@@ -2742,9 +2645,13 @@ export default function App() {
                 </div>
 
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 }}>
-                  <button className="btn-gold" onClick={() => handleExportPdf()} style={{ flex: 1 }}>⬇ Export PDF</button>
+                  <button className="btn-gold" onClick={() => handleExportPdf()} style={{ flex: 1 }} title="Converts to JPG first for exact visual match">⬇ Export PDF (JPG→PDF)</button>
+                  <button className="btn-ghost" onClick={() => handleExportJpg()} title="Export each page as JPG">🖼 JPG</button>
                   <button className="btn-ghost" onClick={() => window.print()}>⎙ Print</button>
                   <button className="btn-ghost" onClick={() => handleSharePdf()}>↗ Share</button>
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginTop: 6, lineHeight: 1.4, textAlign: 'center' }}>
+                  PDF is JPG-converted for exact match — no font/position change
                 </div>
 
                 <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>

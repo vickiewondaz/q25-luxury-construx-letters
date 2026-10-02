@@ -753,13 +753,103 @@ function ImportDocModal({ open, onClose, onExtracted }) {
             throw new Error('PDF parse failed: ' + err.message)
           }
         }
+
+        // First try normal text extraction
         let fullText = ''
         let hasTable = false
+        let isGarbled = false
         const maxPages = Math.min(pdf.numPages, 20)
+        
+        // Helper to fix spaced letters like "S i te c l ea r a n c e" -> "Site clearance"
+        const fixSpacedLetters = (str) => {
+          try {
+            let s = str
+            // Fix the pattern where letters are spaced: "P R O V I S I O N A L" -> "PROVISIONAL"
+            // Count single letters separated by spaces
+            // Replace sequences of single letters with merged word
+            // This handles "D e s crip tio n" -> "Description"
+            
+            // First pass: merge single letters that are part of same word
+            // Pattern: single letter + space + single letter + space + 2-4 letters etc.
+            // We'll do iterative merging of short tokens
+            
+            // Split into tokens
+            const tokens = s.split(/\s+/).filter(t=>t.length>0)
+            if (tokens.length < 3) return s
+            
+            // If many tokens are single letters, likely garbled
+            const singleLetterCount = tokens.filter(t=>t.length===1 && /[A-Za-z]/.test(t)).length
+            const shortCount = tokens.filter(t=>t.length<=3).length
+            if (singleLetterCount / tokens.length > 0.4) {
+              // Garbled - try to reconstruct
+              let reconstructed = ''
+              let currentWord = ''
+              for (let i=0; i<tokens.length; i++) {
+                const tok = tokens[i]
+                // If token is single letter, add to current word
+                if (tok.length === 1 && /[A-Za-z]/.test(tok)) {
+                  currentWord += tok
+                } else if (tok.length <= 4 && /^[A-Za-z,.;:]+$/.test(tok) && !['and','for','the','with','from'].includes(tok.toLowerCase())) {
+                  // Short fragment like "te", "ea", "crip", "tio" - part of word
+                  // Check if next token is also short and likely continuation
+                  currentWord += tok
+                } else {
+                  // Longer token or common word - flush current word
+                  if (currentWord) {
+                    reconstructed += currentWord + ' '
+                    currentWord = ''
+                  }
+                  reconstructed += tok + ' '
+                }
+              }
+              if (currentWord) reconstructed += currentWord
+              // Clean up: fix cases like "Siteclearance," -> should be "Site clearance,"
+              // But for now return reconstructed and then try to split camelCase?
+              s = reconstructed.replace(/\s+/g, ' ').trim()
+              
+              // Second pass: try to fix merged words that should be separate
+              // e.g., "Siteclearance," -> "Site clearance,"
+              // Look for pattern: lowercase + uppercase or known words
+              // Simple: if we have "Site" + "clearance" merged as "Siteclearance", split if second part starts with lowercase and first is capitalized?
+              // Actually our reconstruction may have merged too much, let's try smarter:
+              // We'll split by detecting when currentWord becomes too long (>15) and next char is lowercase start of new word?
+              // For now, keep as is and let later processing handle
+            }
+            
+            // Additional fixes for specific patterns
+            s = s.replace(/\b([A-Z])\s+([a-z])\b/g, '$1$2') // "S i" -> "Si"
+            s = s.replace(/\b([a-z])\s+([a-z]{2,})\b/g, (m,a,b) => {
+              // If a is single and b is 2-3 letters, merge if not common word boundary
+              if (a.length===1) return a+b
+              return m
+            })
+            
+            return s
+          } catch { return str }
+        }
+
+        const isTextGarbled = (text) => {
+          try {
+            // Check for pattern like "P R O V" or "S i te"
+            const singleLetterPattern = (text.match(/\b[A-Za-z]\s+[A-Za-z]\s+[A-Za-z]\b/g) || []).length
+            const spacedPattern = (text.match(/[A-Za-z]\s+[A-Za-z]\s+[A-Za-z]\s+[A-Za-z]/g) || []).length
+            const totalWords = text.split(/\s+/).length
+            if (singleLetterPattern > 5) return true
+            if (spacedPattern > 10) return true
+            // Check ratio of single letters
+            const tokens = text.split(/\s+/).filter(t=>t.length>0)
+            const singleCount = tokens.filter(t=>t.length===1).length
+            if (tokens.length > 20 && singleCount / tokens.length > 0.35) return true
+            // Check for "(cid:" which indicates failed extraction
+            if (text.includes('(cid:')) return true
+            return false
+          } catch { return false }
+        }
+
         for (let i = 1; i <= maxPages; i++) {
           try {
-            setProgress(Math.round((i / maxPages) * 70))
-            setStatus(`Reading PDF page ${i}/${pdf.numPages}...`)
+            setProgress(Math.round((i / maxPages) * 60))
+            setStatus(`Reading PDF page ${i}/${pdf.numPages} — extracting text...`)
             const page = await pdf.getPage(i)
             const content = await page.getTextContent()
             const items = (content.items||[]).map(item => {
@@ -767,6 +857,9 @@ function ImportDocModal({ open, onClose, onExtracted }) {
                 return { str: item.str||'', x: item.transform ? item.transform[4] : 0, y: item.transform ? item.transform[5] : 0, width: item.width||0 }
               } catch { return { str: item.str||'', x: 0, y: 0, width: 0 } }
             }).filter(it => (it.str||'').trim())
+
+            if (items.length === 0) continue
+
             items.sort((a, b) => b.y - a.y || a.x - b.x)
             let rows = []
             let currentRow = []
@@ -778,17 +871,41 @@ function ImportDocModal({ open, onClose, onExtracted }) {
               lastY = item.y
             }
             if (currentRow.length) rows.push(currentRow)
+
             let pageText = ''
             for (const row of rows) {
               try {
                 row.sort((a, b) => a.x - b.x)
-                if (row.length >= 3) {
-                  const gaps = []
-                  for (let j = 1; j < row.length; j++) gaps.push(row[j].x - (row[j-1].x + row[j-1].width))
-                  const avgGap = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0
-                  if (avgGap > 20) { hasTable = true; pageText += row.map(r => r.str).join('\t') + '\n' }
-                  else pageText += row.map(r => r.str).join(' ') + '\n'
-                } else pageText += row.map(r => r.str).join(' ') + '\n'
+                if (row.length === 0) continue
+                
+                // Smart reconstruction: handle gaps
+                let rowStr = ''
+                let lastEnd = null
+                for (const it of row) {
+                  if (lastEnd === null) {
+                    rowStr += it.str
+                  } else {
+                    const gap = it.x - lastEnd
+                    if (gap > 25) {
+                      rowStr += '\t' + it.str
+                      hasTable = true
+                    } else if (gap > 7) {
+                      rowStr += ' ' + it.str
+                    } else if (gap > 1) {
+                      // Small gap - might be word space or part of same word
+                      // If both are single letters, no space, else space
+                      if (it.str.length === 1 && rowStr.slice(-1).match(/[A-Za-z]/) && rowStr.slice(-2,-1) !== ' ') {
+                        rowStr += it.str
+                      } else {
+                        rowStr += ' ' + it.str
+                      }
+                    } else {
+                      rowStr += it.str
+                    }
+                  }
+                  lastEnd = it.x + it.w
+                }
+                pageText += rowStr + '\n'
               } catch {}
             }
             fullText += pageText + '\n'
@@ -798,13 +915,113 @@ function ImportDocModal({ open, onClose, onExtracted }) {
             fullText += `\n[Page ${i} extraction failed: ${pageErr.message}]\n`
           }
         }
+
+        // Check if garbled
+        if (isTextGarbled(fullText) || fullText.length < 500) {
+          console.log('Text appears garbled, trying OCR fallback')
+          setStatus('Text garbled — switching to OCR (this takes 20-40s)...')
+          isGarbled = true
+          
+          try {
+            const { createWorker } = await import('tesseract.js')
+            const worker = await createWorker('eng', 1, {
+              logger: m => {
+                if (m.status === 'recognizing text') {
+                  const pct = 60 + Math.round((m.progress||0) * 35)
+                  setProgress(pct)
+                  setStatus(`OCR page ${Math.floor((pct-60)/35*maxPages)+1}/${maxPages}: ${Math.round((m.progress||0)*100)}%`)
+                }
+              }
+            })
+
+            let ocrText = ''
+            for (let i = 1; i <= maxPages; i++) {
+              try {
+                setStatus(`OCR: Rendering page ${i}/${maxPages}...`)
+                setProgress(60 + Math.round((i / maxPages) * 10))
+                const page = await pdf.getPage(i)
+                const viewport = page.getViewport({ scale: 2.0 })
+                const canvas = document.createElement('canvas')
+                canvas.width = viewport.width
+                canvas.height = viewport.height
+                const ctx = canvas.getContext('2d')
+                if (!ctx) continue
+                
+                // White background
+                ctx.fillStyle = '#ffffff'
+                ctx.fillRect(0, 0, canvas.width, canvas.height)
+                
+                await page.render({ canvasContext: ctx, viewport }).promise
+                
+                setStatus(`OCR: Recognizing page ${i}/${maxPages}...`)
+                const { data } = await worker.recognize(canvas)
+                ocrText += (data.text||'') + '\n\n'
+                
+                if (ocrText.length > 80000) break
+              } catch (ocrPageErr) {
+                console.warn(`OCR page ${i} failed`, ocrPageErr)
+              }
+            }
+            
+            try { await worker.terminate() } catch {}
+            
+            if (ocrText.trim().length > 500) {
+              console.log('OCR succeeded, length', ocrText.length)
+              setStatus(`OCR success! Extracted ${ocrText.length} chars`)
+              fullText = ocrText
+              hasTable = true // OCR text likely has tables
+              isGarbled = false
+            } else {
+              console.log('OCR text too short, keeping original')
+              setStatus('OCR produced little text, using original extraction')
+            }
+          } catch (ocrErr) {
+            console.warn('OCR fallback failed', ocrErr)
+            setStatus('OCR failed, using original text extraction')
+            setErrorMsg('OCR failed: ' + ocrErr.message + ' — using garbled text, will try to fix')
+          }
+        }
+
+        // Try to fix spaced letters if still garbled
+        if (!isGarbled && isTextGarbled(fullText)) {
+          setStatus('Fixing spaced letters in PDF text...')
+          try {
+            const lines = fullText.split('\n')
+            const fixedLines = lines.map(line => {
+              // If line has many single letters, try to fix
+              if ((line.match(/\b[A-Za-z]\b/g)||[]).length > 5) {
+                return fixSpacedLetters(line)
+              }
+              return line
+            })
+            const fixedText = fixedLines.join('\n')
+            // If fixed text is better (less single letters), use it
+            const origSingle = (fullText.match(/\b[A-Za-z]\b/g)||[]).length
+            const fixedSingle = (fixedText.match(/\b[A-Za-z]\b/g)||[]).length
+            if (fixedSingle < origSingle * 0.7) {
+              console.log(`Fixed spaced letters: ${origSingle} -> ${fixedSingle} single letters`)
+              fullText = fixedText
+              setStatus(`Fixed spaced letters: cleaned ${origSingle - fixedSingle} fragments`)
+            }
+          } catch (fixErr) {
+            console.warn('fixSpacedLetters failed', fixErr)
+          }
+        }
+
         setProgress(90)
         try {
           const blocks = detectTableBlocks(fullText)
           const boq = parseBOQ(fullText)
           setIsBOQ(boq.isBOQ)
-          if (boq.isBOQ) { setBoqData(boq); setHasTables(true); setStatus(`BOQ detected! ${boq.sections.length} sections`) }
-          else { setHasTables(hasTable || blocks.some(b=>b.type==='table')); setStatus(hasTable ? `Tables detected!` : `Text extracted`) }
+          if (boq.isBOQ) { 
+            setBoqData(boq); 
+            setHasTables(true); 
+            setStatus(`BOQ detected! ${boq.sections.length} sections, ${boq.sections.reduce((a,s)=>a+s.rows.length,0)} items`) 
+          }
+          else { 
+            setHasTables(hasTable || blocks.some(b=>b.type==='table')); 
+            setStatus(hasTable ? `Tables detected! ${blocks.filter(b=>b.type==='table').length} tables` : `Text extracted (${fullText.length} chars)`) 
+          }
         } catch {}
         setExtractedHtml('')
         setProgress(100)
@@ -872,6 +1089,8 @@ function ImportDocModal({ open, onClose, onExtracted }) {
       throw e
     }
   }
+
+
 
   const handleFiles = async (files) => {
     if (!files || !files.length) return

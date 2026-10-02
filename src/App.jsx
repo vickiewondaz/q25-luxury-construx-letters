@@ -114,6 +114,211 @@ function RichToolbar({ editorRef }) {
   )
 }
 
+// ---------- Document Import (Text, PDF, Word, Scanned) ----------
+function ImportDocModal({ open, onClose, onExtracted }) {
+  const [dragOver, setDragOver] = useState(false)
+  const [status, setStatus] = useState('')
+  const [progress, setProgress] = useState(0)
+  const [extracted, setExtracted] = useState('')
+  const fileRef = useRef(null)
+
+  const formatToHtml = (text) => {
+    // Clean and format extracted text into paragraphs for letterhead
+    const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean)
+    // Try to detect subject/recipient? For now, just paragraphs
+    // Keep line breaks as paragraphs, preserve some structure
+    const paras = []
+    let current = []
+    for (const line of lines) {
+      if (line.length < 80 && (line.endsWith(':') || line.toUpperCase() === line && line.length > 3)) {
+        // Likely heading - flush
+        if (current.length) { paras.push(current.join(' ')); current = [] }
+        paras.push(`<p><strong>${line}</strong></p>`)
+      } else {
+        current.push(line)
+        if (line.endsWith('.') && current.join(' ').length > 120) {
+          paras.push(current.join(' '))
+          current = []
+        }
+      }
+    }
+    if (current.length) paras.push(current.join(' '))
+    // Convert to HTML
+    return paras.map(p => p.startsWith('<p>') ? p : `<p>${p}</p>`).join('\n')
+  }
+
+  const extractText = async (file) => {
+    setStatus(`Reading ${file.name}...`)
+    setProgress(10)
+    const ext = file.name.split('.').pop().toLowerCase()
+    const type = file.type
+
+    try {
+      if (type === 'text/plain' || ext === 'txt') {
+        const txt = await file.text()
+        setProgress(100)
+        return txt
+      }
+      if (type === 'application/pdf' || ext === 'pdf') {
+        setStatus('Extracting PDF (pdf.js)...')
+        const pdfjs = await import('pdfjs-dist')
+        // Use worker
+        const pdfjsLib = pdfjs.default || pdfjs
+        pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs`
+        const buf = await file.arrayBuffer()
+        const pdf = await pdfjsLib.getDocument({ data: buf }).promise
+        let full = ''
+        for (let i = 1; i <= pdf.numPages; i++) {
+          setProgress(Math.round((i / pdf.numPages) * 80))
+          setStatus(`Reading PDF page ${i}/${pdf.numPages}...`)
+          const page = await pdf.getPage(i)
+          const content = await page.getTextContent()
+          const strings = content.items.map(item => item.str).join(' ')
+          full += strings + '\n\n'
+        }
+        setProgress(100)
+        return full
+      }
+      if (ext === 'docx' || type.includes('officedocument.wordprocessingml')) {
+        setStatus('Extracting Word doc (mammoth)...')
+        const mammoth = await import('mammoth')
+        const buf = await file.arrayBuffer()
+        const result = await mammoth.extractRawText({ arrayBuffer: buf })
+        setProgress(100)
+        return result.value
+      }
+      if (ext === 'doc') {
+        setStatus('Legacy .doc - trying mammoth...')
+        try {
+          const mammoth = await import('mammoth')
+          const buf = await file.arrayBuffer()
+          const result = await mammoth.extractRawText({ arrayBuffer: buf })
+          return result.value
+        } catch {
+          return await file.text().catch(() => 'Could not extract .doc - please save as .docx')
+        }
+      }
+      if (type.startsWith('image/') || ['png','jpg','jpeg','webp','bmp'].includes(ext)) {
+        setStatus('Running OCR on scanned document (tesseract.js)... This may take 10-20s')
+        setProgress(20)
+        const { createWorker } = await import('tesseract.js')
+        const worker = await createWorker('eng', 1, {
+          logger: m => {
+            if (m.status === 'recognizing text') {
+              setProgress(20 + Math.round(m.progress * 70))
+              setStatus(`OCR: ${Math.round(m.progress*100)}% - ${m.status}`)
+            }
+          }
+        })
+        const { data } = await worker.recognize(file)
+        await worker.terminate()
+        setProgress(100)
+        return data.text
+      }
+      // Fallback try text
+      return await file.text()
+    } catch (e) {
+      console.error(e)
+      setStatus('Error: ' + e.message)
+      throw e
+    }
+  }
+
+  const handleFiles = async (files) => {
+    if (!files || !files.length) return
+    const file = files[0]
+    try {
+      const text = await extractText(file)
+      setExtracted(text)
+      setStatus(`Extracted ${text.length} characters from ${file.name}`)
+    } catch (err) {
+      setStatus('Failed: ' + err.message)
+    }
+  }
+
+  const handleDrop = (e) => {
+    e.preventDefault()
+    setDragOver(false)
+    handleFiles(e.dataTransfer.files)
+  }
+
+  if (!open) return null
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', padding: 20, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(8px)' }}>
+      <div className="glass-strong" style={{ width: '100%', maxWidth: 720, borderRadius: 24, padding: 24, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <h3 style={{ fontSize: 18 }}>Import Document to Letterhead</h3>
+          <button className="btn-ghost" onClick={onClose} style={{ padding: '6px 12px' }}>✕ Close</button>
+        </div>
+
+        <div
+          onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+          onClick={() => fileRef.current?.click()}
+          style={{
+            border: `2px dashed ${dragOver ? 'var(--gold)' : 'var(--border-strong)'}`,
+            borderRadius: 16,
+            padding: 32,
+            textAlign: 'center',
+            background: dragOver ? 'rgba(201,162,39,0.08)' : 'var(--surface)',
+            cursor: 'pointer',
+            transition: 'all 0.2s'
+          }}
+        >
+          <div style={{ fontSize: 32, marginBottom: 8 }}>📄</div>
+          <div style={{ fontWeight: 700 }}>Drop text, PDF, Word, or scanned image here</div>
+          <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 6 }}>Supports .txt, .pdf, .docx, .doc, .png, .jpg, .jpeg — max 20MB</div>
+          <div style={{ marginTop: 12 }}>
+            <span className="btn-gold" style={{ padding: '8px 16px', fontSize: 13 }}>Browse Files</span>
+          </div>
+          <input ref={fileRef} type="file" accept=".txt,.pdf,.docx,.doc,.png,.jpg,.jpeg,.webp" style={{ display: 'none' }} onChange={e => handleFiles(e.target.files)} />
+        </div>
+
+        {status && (
+          <div className="glass" style={{ marginTop: 16, padding: 12, borderRadius: 12, fontSize: 13 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+              <span>{status}</span>
+              <span>{progress}%</span>
+            </div>
+            <div style={{ height: 6, background: 'var(--border)', borderRadius: 999, overflow: 'hidden' }}>
+              <div style={{ width: `${progress}%`, height: '100%', background: 'var(--gold)', transition: 'width 0.3s' }} />
+            </div>
+          </div>
+        )}
+
+        {extracted && (
+          <div style={{ marginTop: 16 }}>
+            <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)' }}>EXTRACTED TEXT ({extracted.length} chars)</label>
+            <div className="input-glass" style={{ marginTop: 6, maxHeight: 240, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.6 }}>{extracted.slice(0, 4000)}{extracted.length > 4000 ? '\n... (truncated preview)' : ''}</div>
+
+            <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+              <button className="btn-gold" onClick={() => {
+                const html = formatToHtml(extracted)
+                onExtracted(html, extracted)
+                onClose()
+              }}>✨ Format & Put on Letterhead</button>
+              <button className="btn-ghost" onClick={() => {
+                // Try to auto-detect subject/recipient? Simple heuristic
+                const lines = extracted.split('\n').filter(l => l.trim()).slice(0,5)
+                const subject = lines.find(l => l.toLowerCase().includes('subject:'))?.replace(/subject:/i,'').trim() || ''
+                onExtracted(formatToHtml(extracted), extracted, { subject })
+                onClose()
+              }}>Auto-detect Subject</button>
+              <button className="btn-ghost" onClick={() => { setExtracted(''); setStatus(''); setProgress(0) }}>Clear</button>
+            </div>
+
+            <div style={{ marginTop: 12, fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.4 }}>
+              <strong>How formatting works:</strong> Extracted text is cleaned, split into paragraphs, and placed into the letter body on your real Q25 letterhead (Page 1 = Letter 1, rest = Letter 2). You can then edit, add recipient, subject, and export PDF with CEO signature.
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ---------- Preview ----------
 function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true }) {
   const containerRef = useRef(null)
@@ -518,6 +723,7 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState('all')
   const [yearFilter, setYearFilter] = useState('all')
   const [isMobilePreview, setIsMobilePreview] = useState(false)
+  const [showImport, setShowImport] = useState(false)
 
   const supabase = getSupabase()
 
@@ -765,7 +971,10 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)', marginBottom: 6, display: 'block' }}>BODY</label>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)', display: 'block' }}>BODY</label>
+                    <button className="btn-gold" style={{ padding: '6px 12px', fontSize: 11 }} onClick={() => setShowImport(true)}>📄 Import Doc / Scan</button>
+                  </div>
                   <RichToolbar editorRef={editorRef} />
                   <div
                     ref={editorRef}
@@ -983,6 +1192,24 @@ export default function App() {
           <button key={it.id} onClick={() => setView(it.id)} style={{ flex: 1, borderRadius: 14, padding: '10px 6px', border: 'none', background: view === it.id ? 'var(--gold)' : 'transparent', color: view === it.id ? '#000' : 'var(--text)', fontWeight: 700, fontSize: 12 }}>{it.icon} {it.label}</button>
         ))}
       </div>
+
+      {/* Import Modal */}
+      <ImportDocModal
+        open={showImport}
+        onClose={() => setShowImport(false)}
+        onExtracted={(html, raw, meta) => {
+          if (!current) return
+          const newBody = html + (current.body && current.body !== '<p></p>' ? '<br/><br/>' + current.body : '')
+          setCurrent({
+            ...current,
+            body: newBody,
+            subject: meta?.subject || current.subject
+          })
+          if (editorRef.current) {
+            editorRef.current.innerHTML = newBody
+          }
+        }}
+      />
 
       {/* Print styles */}
       <style>{`

@@ -6,8 +6,8 @@ const COMPANY = 'Q25 LUXURY CONSTRUX'
 const GOLD = '#C9A227'
 
 const DEFAULT_MARGINS = {
-  p1: { top: 210, bottom: 115, left: 62, right: 58 },
-  p2: { top: 82, bottom: 85, left: 62, right: 58 }
+  p1: { top: 218, bottom: 118, left: 64, right: 60 },
+  p2: { top: 84, bottom: 88, left: 64, right: 60 }
 }
 
 const uid = () => Math.random().toString(36).slice(2, 10)
@@ -1247,147 +1247,191 @@ function ImportDocModal({ open, onClose, onExtracted }) {
 }
 
 
-// ---------- Preview - ROBUST (won't crash on large PDFs) ----------
+// Shared block builder - used by both preview and PDF for perfect match
+function buildLetterBlocks(letter, showSignature) {
+  try {
+    const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
+    const ref = (letter.reference_no || '').slice(0, 50)
+    const blockList = []
+
+    // Ref & Date - professional spacing 24px top, 28px bottom
+    blockList.push({
+      id: 'refdate',
+      type: 'refdate',
+      html: `<div class="letter-block lb-ref" style="break-inside:avoid; page-break-inside:avoid; margin-top:24px; margin-bottom:28px; padding-top:6px; display:flex; justify-content:space-between; font-size:10.5pt; line-height:1.4; letter-spacing:0.1px">
+          <div style="font-weight:700; letter-spacing:0.2px; color:#111">Ref: ${ref}</div>
+          <div style="text-align:right; font-weight:500; color:#222">${dateStr}</div>
+        </div>`,
+      text: `Ref: ${ref} | ${dateStr}`,
+      keepTogether: true,
+      heightEstimate: 28
+    })
+
+    // Recipient - 24px bottom
+    if (letter.recipient_name || letter.recipient_title || letter.recipient_address) {
+      let html = `<div class="letter-block lb-recipient" style="break-inside:avoid; page-break-inside:avoid; margin-bottom:24px; line-height:1.55">`
+      if (letter.recipient_name) html += `<div style="font-weight:700; font-size:11.5pt; color:#111; margin-bottom:2px">${(letter.recipient_name||'').slice(0,200)}</div>`
+      if (letter.recipient_title) html += `<div style="font-size:10.5pt; color:#222; margin-bottom:2px">${(letter.recipient_title||'').slice(0,200)}</div>`
+      if (letter.recipient_address) html += `<div style="white-space:pre-line; font-size:10.5pt; color:#222; margin-top:3px; line-height:1.5">${(letter.recipient_address||'').slice(0,500)}</div>`
+      html += `</div>`
+      blockList.push({ id: 'recipient', type: 'recipient', html, text: `${letter.recipient_name||''} ${letter.recipient_title||''}`, keepTogether: true, heightEstimate: 60 })
+    }
+
+    // Subject - 24px top, 18px bottom, extra spacing
+    if (letter.subject) {
+      blockList.push({
+        id: 'subject',
+        type: 'subject',
+        html: `<div class="letter-block lb-subject" style="break-inside:avoid; page-break-inside:avoid; margin:26px 0 18px 0; font-size:11pt; line-height:1.5"><span style="font-weight:700; color:#111">Subject: </span><span style="font-weight:700; text-decoration:underline; text-underline-offset:4px; text-decoration-thickness:1.2px; color:#111">${(letter.subject||'').slice(0,300)}</span></div>`,
+        text: `Subject: ${letter.subject}`,
+        keepTogether: true,
+        heightEstimate: 28
+      })
+    }
+
+    // Salutation - 20px top, 28px bottom (enough spacing before main heading/content)
+    if (letter.salutation) {
+      blockList.push({
+        id: 'salutation',
+        type: 'salutation',
+        html: `<div class="letter-block lb-salutation" style="break-inside:avoid; page-break-inside:avoid; margin:20px 0 30px 0; font-size:11.5pt; color:#111; line-height:1.5">${(letter.salutation||'').slice(0,200)}</div>`,
+        text: letter.salutation,
+        keepTogether: true,
+        heightEstimate: 24
+      })
+    }
+
+    // Body - split with heading detection and spacing
+    const bodyHtml = (letter.body || '<p style="color:#999">Start typing your letter...</p>').slice(0, 100000)
+    try {
+      const doc = new DOMParser().parseFromString(`<div>${bodyHtml}</div>`, 'text/html')
+      const root = doc.body.firstChild
+      if (root) {
+        let count = 0
+        Array.from(root.childNodes).forEach((node, idx) => {
+          if (count > 200) return
+          try {
+            if (node.nodeType === 3) {
+              const txt = (node.textContent||'').trim().slice(0,2000)
+              if (txt) {
+                const isHeading = txt.length < 90 && (txt.endsWith(':') || (txt.toUpperCase() === txt && txt.length > 4 && txt.length < 80))
+                const margin = isHeading ? '28px 0 14px 0' : '14px 0'
+                const style = isHeading ? 'font-weight:800; font-size:12.5pt; color:#111; letter-spacing:0.2px' : 'font-size:11.5pt; line-height:1.7; text-align:justify; color:#111'
+                blockList.push({
+                  id: `body-text-${idx}`,
+                  type: isHeading ? 'heading' : 'paragraph',
+                  html: `<div class="letter-block ${isHeading ? 'lb-heading' : 'lb-para'}" style="break-inside:avoid; page-break-inside:avoid; margin:${margin}; ${style}">${txt}</div>`,
+                  text: txt,
+                  keepTogether: true,
+                  heightEstimate: isHeading ? 32 : 50
+                })
+                count++
+              }
+              return
+            }
+            if (node.nodeType === 1) {
+              const tag = node.tagName.toLowerCase()
+              let outer = ''
+              try { outer = node.outerHTML.slice(0, 25000) } catch { outer = `<p>${(node.textContent||'').slice(0,2000)}</p>` }
+              
+              if (tag === 'table') {
+                // Always identify total figure in table - separate logic
+                blockList.push({
+                  id: `body-table-${idx}`,
+                  type: 'table',
+                  html: `<div class="letter-block lb-table" style="break-inside:avoid; page-break-inside:avoid; margin:22px 0">${outer}</div>`,
+                  text: 'TABLE',
+                  keepTogether: true,
+                  isTable: true,
+                  heightEstimate: 120
+                })
+              } else if (['ul','ol'].includes(tag)) {
+                blockList.push({
+                  id: `body-list-${idx}`,
+                  type: 'list',
+                  html: `<div class="letter-block lb-list" style="break-inside:avoid; page-break-inside:avoid; margin:16px 0 16px 4px">${outer}</div>`,
+                  keepTogether: true,
+                  heightEstimate: 60
+                })
+              } else if (['h1','h2','h3','h4'].includes(tag)) {
+                // Headings - extra spacing
+                blockList.push({
+                  id: `body-heading-${idx}`,
+                  type: 'heading',
+                  html: `<div class="letter-block lb-heading" style="break-inside:avoid; page-break-inside:avoid; margin:30px 0 16px 0; font-weight:800; font-size:13pt; color:#111; letter-spacing:0.2px">${outer}</div>`,
+                  text: node.textContent||'',
+                  keepTogether: true,
+                  heightEstimate: 36
+                })
+              } else {
+                // Check if p/div is heading
+                const txtContent = (node.textContent||'').trim()
+                const isHeading = txtContent.length < 90 && (txtContent.endsWith(':') || (txtContent.toUpperCase() === txtContent && txtContent.length > 4 && txtContent.length < 80))
+                const margin = isHeading ? '28px 0 14px 0' : '14px 0'
+                blockList.push({
+                  id: `body-${idx}`,
+                  type: isHeading ? 'heading' : tag,
+                  html: `<div class="letter-block ${isHeading ? 'lb-heading' : 'lb-para'}" style="break-inside:avoid; page-break-inside:avoid; margin:${margin}">${outer}</div>`,
+                  text: txtContent.slice(0,500),
+                  keepTogether: true,
+                  heightEstimate: isHeading ? 32 : 50
+                })
+              }
+              count++
+            }
+          } catch {}
+        })
+      } else {
+        blockList.push({
+          id: 'body-fallback',
+          type: 'body',
+          html: `<div class="letter-block lb-para" style="break-inside:avoid; margin:14px 0">${bodyHtml.slice(0,10000)}</div>`,
+          text: bodyHtml.slice(0,500),
+          keepTogether: false,
+          heightEstimate: 100
+        })
+      }
+    } catch (e) {
+      console.warn('body parse failed', e)
+      blockList.push({
+        id: 'body-fallback',
+        type: 'body',
+        html: `<div class="letter-block" style="margin:14px 0"><p>${(letter.body||'').replace(/<[^>]+>/g,' ').slice(0,5000)}</p></div>`,
+        text: 'fallback',
+        keepTogether: false,
+        heightEstimate: 100
+      })
+    }
+
+    // Sign-off - keep together, 40px top spacing
+    const signOffHtml = `
+      <div class="letter-block lb-signoff" style="break-inside:avoid; page-break-inside:avoid; margin-top:42px; line-height:1.5">
+        <div style="font-size:11.5pt; margin-bottom:8px; color:#111">${(letter.closing_line || 'Yours sincerely,').slice(0,100)}</div>
+        ${showSignature ? `<img src="/sign.png" alt="signature" style="height:68px; margin:14px 0 10px 0; object-fit:contain; display:block" onerror="this.style.display='none'" />` : '<div style="height:48px"></div>'}
+        <div style="font-weight:800; font-size:12pt; letter-spacing:0.2px; margin-top:6px; color:#111">${OWNER.name}</div>
+        <div style="font-weight:700; font-size:10.5pt; color:#222">${OWNER.position}</div>
+      </div>`
+    blockList.push({ id: 'signoff', type: 'signoff', html: signOffHtml, text: `${letter.closing_line||''} ${OWNER.name}`, keepTogether: true, heightEstimate: 140 })
+
+    return blockList.slice(0, 200)
+  } catch (e) {
+    console.error('buildLetterBlocks failed', e)
+    return [
+      { id: 'error', html: `<div style="color:#b71c1c; padding:10px; border:1px solid #ffcdd2; border-radius:8px">Preview error: ${e.message}</div>`, text: 'error', heightEstimate: 40 },
+      { id: 'refdate', html: `<div>Ref: ${letter.reference_no||''} - ${letter.letter_date||''}</div>`, text: 'ref', heightEstimate: 20 },
+      { id: 'body', html: `<div>${(letter.body||'').slice(0,5000)}</div>`, text: 'body', heightEstimate: 100 }
+    ]
+  }
+}
+
+// ---------- Preview - ROBUST with blank page removal & heading spacing ----------
 function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true }) {
   const containerRef = useRef(null)
   const contentMeasureRef = useRef(null)
   const [pagesData, setPagesData] = useState([[]])
   const [error, setError] = useState(null)
 
-  const blocks = useMemo(() => {
-    try {
-      const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
-      const ref = (letter.reference_no || '').slice(0, 50)
-
-      const blockList = []
-
-      blockList.push({
-        id: 'refdate',
-        type: 'refdate',
-        html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-top:18px; margin-bottom:22px; padding-top:8px; display:flex; justify-content:space-between; font-size:10.5pt; align-items:flex-start; line-height:1.4">
-          <div style="font-weight:700; letter-spacing:0.2px">Ref: ${ref}</div>
-          <div style="text-align:right; font-weight:500; color:#222">${dateStr}</div>
-        </div>`,
-        keepTogether: true
-      })
-
-      if (letter.recipient_name || letter.recipient_title || letter.recipient_address) {
-        let html = `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-bottom:20px; line-height:1.5">`
-        if (letter.recipient_name) html += `<div style="font-weight:700; font-size:11.5pt">${(letter.recipient_name||'').slice(0,200)}</div>`
-        if (letter.recipient_title) html += `<div style="font-size:10.5pt; color:#222">${(letter.recipient_title||'').slice(0,200)}</div>`
-        if (letter.recipient_address) html += `<div style="white-space:pre-line; font-size:10.5pt; margin-top:2px">${(letter.recipient_address||'').slice(0,500)}</div>`
-        html += `</div>`
-        blockList.push({ id: 'recipient', type: 'recipient', html, keepTogether: true })
-      }
-
-      if (letter.subject) {
-        blockList.push({
-          id: 'subject',
-          type: 'subject',
-          html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:16px 0 14px 0; font-size:11pt"><span style="font-weight:700">Subject: </span><span style="font-weight:700; text-decoration:underline; text-underline-offset:3px">${(letter.subject||'').slice(0,300)}</span></div>`,
-          keepTogether: true
-        })
-      }
-
-      if (letter.salutation) {
-        blockList.push({
-          id: 'salutation',
-          type: 'salutation',
-          html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:12px 0 16px 0; font-size:11.5pt">${(letter.salutation||'').slice(0,200)}</div>`,
-          keepTogether: true
-        })
-      }
-
-      const bodyHtml = (letter.body || '<p style="color:#999">Start typing your letter...</p>').slice(0, 100000)
-      try {
-        const doc = new DOMParser().parseFromString(`<div>${bodyHtml}</div>`, 'text/html')
-        const root = doc.body.firstChild
-        if (root) {
-          let count = 0
-          Array.from(root.childNodes).forEach((node, idx) => {
-            if (count > 150) return
-            try {
-              if (node.nodeType === 3) {
-                const txt = (node.textContent||'').trim().slice(0,2000)
-                if (txt) {
-                  blockList.push({
-                    id: `body-text-${idx}`,
-                    type: 'paragraph',
-                    html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:10px 0; font-size:11.5pt; line-height:1.65">${txt}</div>`,
-                    keepTogether: false
-                  })
-                  count++
-                }
-                return
-              }
-              if (node.nodeType === 1) {
-                const tag = node.tagName.toLowerCase()
-                let outer = ''
-                try { outer = node.outerHTML.slice(0, 20000) } catch { outer = `<p>${(node.textContent||'').slice(0,2000)}</p>` }
-                if (tag === 'table') {
-                  blockList.push({
-                    id: `body-table-${idx}`,
-                    type: 'table',
-                    html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:18px 0">${outer}</div>`,
-                    keepTogether: true,
-                    isTable: true
-                  })
-                } else if (['ul','ol'].includes(tag)) {
-                  blockList.push({
-                    id: `body-list-${idx}`,
-                    type: 'list',
-                    html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:12px 0">${outer}</div>`,
-                    keepTogether: true
-                  })
-                } else {
-                  blockList.push({
-                    id: `body-${idx}`,
-                    type: tag,
-                    html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:10px 0">${outer}</div>`,
-                    keepTogether: tag !== 'div'
-                  })
-                }
-                count++
-              }
-            } catch {}
-          })
-        } else {
-          blockList.push({
-            id: 'body-fallback',
-            type: 'body',
-            html: `<div class="letter-block" style="break-inside:avoid; margin:10px 0">${bodyHtml.slice(0,10000)}</div>`,
-            keepTogether: false
-          })
-        }
-      } catch (e) {
-        console.warn('body parse failed', e)
-        blockList.push({
-          id: 'body-fallback',
-          type: 'body',
-          html: `<div class="letter-block" style="margin:10px 0"><p>${(letter.body||'').replace(/<[^>]+>/g,' ').slice(0,5000)}</p></div>`,
-          keepTogether: false
-        })
-      }
-
-      const signOffHtml = `
-        <div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-top:36px; line-height:1.5">
-          <div style="font-size:11.5pt; margin-bottom:6px">${(letter.closing_line || 'Yours sincerely,').slice(0,100)}</div>
-          ${showSignature ? `<img src="/sign.png" alt="signature" style="height:68px; margin:12px 0 8px 0; object-fit:contain; display:block" onerror="this.style.display='none'" />` : '<div style="height:48px"></div>'}
-          <div style="font-weight:800; font-size:12pt; letter-spacing:0.2px; margin-top:4px">${OWNER.name}</div>
-          <div style="font-weight:700; font-size:10.5pt; color:#222">${OWNER.position}</div>
-        </div>`
-      blockList.push({ id: 'signoff', type: 'signoff', html: signOffHtml, keepTogether: true })
-
-      return blockList.slice(0, 200)
-    } catch (e) {
-      console.error('blocks useMemo failed', e)
-      return [
-        { id: 'error', html: `<div style="color:#b71c1c; padding:10px; border:1px solid #ffcdd2; border-radius:8px">Preview error: ${e.message}. Showing simplified view.</div>` },
-        { id: 'refdate', html: `<div>Ref: ${letter.reference_no||''} - ${letter.letter_date||''}</div>` },
-        { id: 'body', html: `<div>${(letter.body||'').slice(0,5000)}</div>` }
-      ]
-    }
-  }, [letter, showSignature])
+  const blocks = useMemo(() => buildLetterBlocks(letter, showSignature), [letter, showSignature])
 
   useEffect(() => {
     try {
@@ -1400,10 +1444,10 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
       for (const block of blocks) {
         try {
           measurer.innerHTML = block.html
-          const h = measurer.scrollHeight || 40
-          measurements.push({ ...block, measuredHeight: Math.min(h + 4, 800) })
+          const h = measurer.scrollHeight || block.heightEstimate || 40
+          measurements.push({ ...block, measuredHeight: Math.min(h + 6, 800) })
         } catch {
-          measurements.push({ ...block, measuredHeight: 60 })
+          measurements.push({ ...block, measuredHeight: block.heightEstimate || 60 })
         }
       }
 
@@ -1419,9 +1463,16 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
         const blk = measurements[i]
         const blkH = blk.measuredHeight
 
+        // Skip empty blocks that would create blank pages
+        const isEmpty = !blk.html || blk.html.replace(/<[^>]+>/g,'').trim().length === 0
+        if (isEmpty && blk.type !== 'table') continue
+
         if (blkH > currentUsable) {
           if (currentPageBlocks.length > 0) {
-            pages.push(currentPageBlocks)
+            // Only push non-empty pages
+            if (currentPageBlocks.some(b => b.html && b.html.replace(/<[^>]+>/g,'').trim().length > 0)) {
+              pages.push(currentPageBlocks)
+            }
             currentPageBlocks = []
             currentHeight = 0
             currentUsable = p2Usable
@@ -1445,7 +1496,9 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
         }
 
         if (currentHeight + blkH > currentUsable) {
-          pages.push(currentPageBlocks)
+          if (currentPageBlocks.length > 0) {
+            pages.push(currentPageBlocks)
+          }
           currentPageBlocks = [blk]
           currentHeight = blkH
           currentUsable = p2Usable
@@ -1454,15 +1507,32 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
           currentHeight += blkH
         }
       }
-      if (currentPageBlocks.length > 0) pages.push(currentPageBlocks)
-      if (pages.length === 0) pages.push(measurements)
+      if (currentPageBlocks.length > 0) {
+        // Remove blank trailing page
+        const hasContent = currentPageBlocks.some(b => {
+          const txt = (b.text||'').trim() || b.html.replace(/<[^>]+>/g,'').trim()
+          return txt.length > 0
+        })
+        if (hasContent) pages.push(currentPageBlocks)
+      }
 
-      setPagesData(pages)
+      // Remove unwanted blank pages - filter out pages with no meaningful content
+      const filteredPages = pages.filter(pageBlocks => {
+        if (!pageBlocks || pageBlocks.length === 0) return false
+        const totalText = pageBlocks.map(b => (b.text||'') + b.html.replace(/<[^>]+>/g,'')).join('').trim()
+        const hasTable = pageBlocks.some(b => b.isTable)
+        // Keep page if has table or has at least 10 chars of text
+        return hasTable || totalText.length > 10
+      })
+
+      // Ensure at least 1 page
+      const finalPages = filteredPages.length > 0 ? filteredPages : (pages.length > 0 ? pages : [measurements])
+
+      setPagesData(finalPages)
       setError(null)
     } catch (e) {
       console.error('LetterPreview pagination failed', e)
       setError(e.message)
-      // Fallback to single page with all blocks
       setPagesData([blocks])
     }
   }, [blocks, margins])
@@ -1471,11 +1541,11 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
     return (
       <div style={{ width: '100%' }}>
         <div style={{ background: '#fff3f3', border: '1px solid #ffcdd2', borderRadius: 12, padding: 16, marginBottom: 16, fontSize: 13, color: '#b71c1c' }}>
-          Preview pagination error: {error} — showing fallback
+          Preview error: {error} — fallback
         </div>
         <div className="a4-page" style={{ width: 794, minHeight: 1123, position: 'relative' }}>
           <img src="/letter1.png" alt="letterhead" className="a4-bg" onError={(e)=>e.target.style.display='none'} />
-          <div style={{ position: 'absolute', left: margins.p1.left, right: margins.p1.right, top: margins.p1.top, bottom: margins.p1.bottom, overflow: 'auto', fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.65 }}>
+          <div style={{ position: 'absolute', left: margins.p1.left, right: margins.p1.right, top: margins.p1.top, bottom: margins.p1.bottom, overflow: 'auto', fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.7 }}>
             {blocks.map(b => <div key={b.id} dangerouslySetInnerHTML={{ __html: b.html }} />)}
           </div>
         </div>
@@ -1485,7 +1555,7 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
 
   return (
     <div ref={containerRef} style={{ width: '100%' }}>
-      <div ref={contentMeasureRef} style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none', left: -9999, top: 0, fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.65, color: '#111' }} />
+      <div ref={contentMeasureRef} style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none', left: -9999, top: 0, fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.7, color: '#111' }} />
 
       {pagesData.map((pageBlocks, idx) => {
         const isFirst = idx === 0
@@ -1495,13 +1565,13 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
           <div key={idx} className="a4-page" style={{ width: 794, height: 1123, position: 'relative' }}>
             <img src={bg} alt="letterhead" className="a4-bg" onError={(e)=>e.target.style.display='none'} />
             <div style={{ position: 'absolute', left: m.left, right: m.right, top: m.top, bottom: m.bottom, overflow: 'hidden' }}>
-              <div style={{ width: '100%', fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.65, color: '#111' }}>
+              <div style={{ width: '100%', fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.7, color: '#111' }}>
                 {pageBlocks.map(b => (
                   <div key={b.id} dangerouslySetInnerHTML={{ __html: b.html }} />
                 ))}
               </div>
             </div>
-            <div style={{ position: 'absolute', bottom: 10, right: 18, fontSize: 9, color: '#999', fontFamily: 'Nunito Sans', letterSpacing: 0.3 }}>Page {idx + 1} of {pagesData.length}</div>
+            <div style={{ position: 'absolute', bottom: 12, right: 20, fontSize: 8.5, color: '#999', fontFamily: 'Nunito Sans', letterSpacing: 0.3 }}>Page {idx + 1} of {pagesData.length}</div>
           </div>
         )
       })}
@@ -1509,135 +1579,122 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
   )
 }
 
-
-// ---------- PDF Export (lazy-loaded) - ROBUST FIX ----------
+// ---------- PDF Export - EXACT MATCH to Preview, No Font/Position Change ----------
 async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature = true) {
   try {
     const { PDFDocument, rgb, StandardFonts } = await import('pdf-lib')
     const pdfDoc = await PDFDocument.create()
     const A4 = [595.28, 841.89]
 
-    // Load fonts with robust fallback
+    // Load fonts - exact same as preview (Nunito Sans)
     let fontMed, fontBold, fontExtra
     try {
       const [medBytes, boldBytes, extraBytes] = await Promise.all([
-        fetch('/fonts/NunitoSans-Medium.ttf').then(r => { if (!r.ok) throw new Error('med font fetch failed'); return r.arrayBuffer() }).catch(() => null),
-        fetch('/fonts/NunitoSans-Bold.ttf').then(r => { if (!r.ok) throw new Error('bold font fetch failed'); return r.arrayBuffer() }).catch(() => null),
-        fetch('/fonts/NunitoSans-ExtraBold.ttf').then(r => { if (!r.ok) throw new Error('extra font fetch failed'); return r.arrayBuffer() }).catch(() => null),
+        fetch('/fonts/NunitoSans-Medium.ttf').then(r => { if (!r.ok) throw new Error('med font'); return r.arrayBuffer() }).catch(() => null),
+        fetch('/fonts/NunitoSans-Bold.ttf').then(r => { if (!r.ok) throw new Error('bold font'); return r.arrayBuffer() }).catch(() => null),
+        fetch('/fonts/NunitoSans-ExtraBold.ttf').then(r => { if (!r.ok) throw new Error('extra font'); return r.arrayBuffer() }).catch(() => null),
       ])
-      try {
-        fontMed = medBytes ? await pdfDoc.embedFont(medBytes) : await pdfDoc.embedFont(StandardFonts.Helvetica)
-      } catch { fontMed = await pdfDoc.embedFont(StandardFonts.Helvetica) }
-      try {
-        fontBold = boldBytes ? await pdfDoc.embedFont(boldBytes) : await pdfDoc.embedFont(StandardFonts.HelveticaBold)
-      } catch { fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold) }
-      try {
-        fontExtra = extraBytes ? await pdfDoc.embedFont(extraBytes) : fontBold
-      } catch { fontExtra = fontBold }
-    } catch (fontErr) {
-      console.warn('Font loading failed, using standard', fontErr)
+      try { fontMed = medBytes ? await pdfDoc.embedFont(medBytes) : await pdfDoc.embedFont(StandardFonts.Helvetica) } catch { fontMed = await pdfDoc.embedFont(StandardFonts.Helvetica) }
+      try { fontBold = boldBytes ? await pdfDoc.embedFont(boldBytes) : await pdfDoc.embedFont(StandardFonts.HelveticaBold) } catch { fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold) }
+      try { fontExtra = extraBytes ? await pdfDoc.embedFont(extraBytes) : fontBold } catch { fontExtra = fontBold }
+    } catch {
       fontMed = await pdfDoc.embedFont(StandardFonts.Helvetica)
       fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
       fontExtra = fontBold
     }
 
-    // Load letterhead images with fallback - if fails, use blank
+    // Load letterhead images
     let letter1Img = null, letter2Img = null, signImg = null
     try {
-      const [letter1Bytes, letter2Bytes] = await Promise.all([
+      const [l1, l2] = await Promise.all([
         fetch('/letter1.png').then(r => r.ok ? r.arrayBuffer() : null).catch(() => null),
         fetch('/letter2.png').then(r => r.ok ? r.arrayBuffer() : null).catch(() => null),
       ])
-      if (letter1Bytes) {
-        try { letter1Img = await pdfDoc.embedPng(letter1Bytes) } catch(e){ console.warn('letter1 embed failed', e) }
-      }
-      if (letter2Bytes) {
-        try { letter2Img = await pdfDoc.embedPng(letter2Bytes) } catch(e){ console.warn('letter2 embed failed', e) }
-      }
-    } catch(e){ console.warn('letterhead fetch failed', e) }
-
+      if (l1) { try { letter1Img = await pdfDoc.embedPng(l1) } catch {} }
+      if (l2) { try { letter2Img = await pdfDoc.embedPng(l2) } catch {} }
+    } catch {}
     if (showSignature) {
       try {
-        const signBytes = await fetch('/sign.png').then(r => r.ok ? r.arrayBuffer() : null).catch(() => null)
-        if (signBytes) {
-          try { signImg = await pdfDoc.embedPng(signBytes) } catch(e){ console.warn('sign embed failed', e) }
-        }
-      } catch(e){ console.warn('sign fetch failed', e) }
+        const sb = await fetch('/sign.png').then(r => r.ok ? r.arrayBuffer() : null).catch(() => null)
+        if (sb) { try { signImg = await pdfDoc.embedPng(sb) } catch {} }
+      } catch {}
     }
 
-    const parseHtmlToBlocks = (html) => {
+    // Use shared block builder for EXACT match
+    const blocks = buildLetterBlocks(letter, showSignature)
+
+    // Helper to parse table blocks - identify total figure, don't mix text
+    const parseTableBlock = (blockHtml) => {
       try {
-        const doc = new DOMParser().parseFromString(html, 'text/html')
-        const blocks = []
-        const walk = (node, styles = {}) => {
-          if (node.nodeType === 3) {
-            const text = node.textContent
-            if (text && text.trim()) blocks.push({ type: 'text', text, ...styles })
-            return
-          }
-          if (node.nodeType !== 1) return
-          const tag = node.tagName.toLowerCase()
-          const newStyles = { ...styles }
-          if (['b', 'strong'].includes(tag)) newStyles.bold = true
-          if (['i', 'em'].includes(tag)) newStyles.italic = true
-          if (tag === 'u') newStyles.underline = true
-          if (tag === 'br') { blocks.push({ type: 'br' }); return }
-          if (tag === 'table') {
-            try {
-              const rows = []
-              const thead = node.querySelector('thead')
-              const tbody = node.querySelector('tbody') || node
-              const headerRows = thead ? Array.from(thead.querySelectorAll('tr')) : []
-              const bodyRows = Array.from(tbody.querySelectorAll('tr'))
-              const parseRow = (tr) => {
-                return Array.from(tr.querySelectorAll('th, td')).map(cell => ({
-                  text: (cell.textContent || '').trim().slice(0, 200),
-                  isHeader: cell.tagName.toLowerCase() === 'th',
-                  colspan: parseInt(cell.getAttribute('colspan') || '1', 10) || 1
-                }))
-              }
-              if (headerRows.length) {
-                headerRows.forEach(tr => { try{ rows.push({ cells: parseRow(tr), isHeader: true }) }catch{} })
-              }
-              bodyRows.forEach(tr => {
-                if (thead && thead.contains(tr)) return
-                try{ rows.push({ cells: parseRow(tr), isHeader: false }) }catch{}
-              })
-              if (rows.length) blocks.push({ type: 'table', rows })
-            } catch(e){ console.warn('table parse failed', e) }
-            return
-          }
-          if (tag === 'p' || tag === 'div') {
-            if (blocks.length && blocks[blocks.length - 1].type !== 'br') blocks.push({ type: 'br' })
-            const align = node.style?.textAlign || ''
-            if (align) newStyles.align = align
-            try{ Array.from(node.childNodes).forEach(c => walk(c, newStyles)) }catch{}
-            blocks.push({ type: 'br' })
-            if (tag === 'p') blocks.push({ type: 'br' })
-            return
-          }
-          if (tag === 'li') {
-            blocks.push({ type: 'text', text: '• ', ...newStyles })
-            try{ Array.from(node.childNodes).forEach(c => walk(c, newStyles)) }catch{}
-            blocks.push({ type: 'br' })
-            return
-          }
-          if (['ul', 'ol'].includes(tag)) {
-            try{ Array.from(node.childNodes).forEach(c => walk(c, newStyles)) }catch{}
-            return
-          }
-          try{ Array.from(node.childNodes).forEach(c => walk(c, newStyles)) }catch{}
+        const doc = new DOMParser().parseFromString(blockHtml, 'text/html')
+        const table = doc.querySelector('table')
+        if (!table) return null
+        
+        const rows = []
+        const thead = table.querySelector('thead')
+        const tbody = table.querySelector('tbody') || table
+        
+        // Extract headers
+        let headers = []
+        if (thead) {
+          const ths = thead.querySelectorAll('th')
+          headers = Array.from(ths).map(th => (th.textContent||'').trim().slice(0,50))
         }
-        Array.from(doc.body.childNodes).forEach(n => { try{ walk(n, {}) }catch{} })
-        return blocks
-      } catch(e){
-        console.warn('parseHtmlToBlocks failed', e)
-        return [{ type: 'text', text: (html || '').replace(/<[^>]+>/g, ' ').slice(0, 5000) }]
+        
+        // Extract body rows
+        const trs = tbody.querySelectorAll('tr')
+        for (const tr of trs) {
+          if (thead && thead.contains(tr)) continue
+          const cells = Array.from(tr.querySelectorAll('td, th')).map(cell => ({
+            text: (cell.textContent||'').trim().slice(0,200),
+            isHeader: cell.tagName.toLowerCase() === 'th',
+            colspan: parseInt(cell.getAttribute('colspan')||'1')||1,
+            isTotal: /total|grand total|subtotal|sum|balance|payable/i.test((cell.textContent||''))
+          }))
+          if (cells.length > 0) {
+            const rowText = cells.map(c=>c.text).join(' ').toLowerCase()
+            const isTotalRow = /total|grand total|subtotal|sum total|balance|amount payable|grand total/i.test(rowText)
+            rows.push({ cells, isTotal: isTotalRow, isHeader: cells.some(c=>c.isHeader) })
+          }
+        }
+        
+        // Always identify total figure - find last row with total or largest amount
+        let grandTotal = null
+        let grandTotalRow = null
+        for (let i = rows.length - 1; i >= 0; i--) {
+          if (rows[i].isTotal) {
+            // Find numeric value in this row
+            for (const cell of rows[i].cells) {
+              const numMatch = cell.text.match(/₦?\s*([0-9,]+\.?\d*)/)
+              if (numMatch) {
+                grandTotal = numMatch[1]
+                grandTotalRow = rows[i]
+                break
+              }
+            }
+            if (grandTotal) break
+          }
+        }
+        // If no explicit total row, check if last row has large number
+        if (!grandTotal && rows.length > 0) {
+          const lastRow = rows[rows.length-1]
+          for (const cell of lastRow.cells) {
+            if (/₦?\s*[0-9,]{4,}/.test(cell.text)) {
+              const m = cell.text.match(/₦?\s*([0-9,]+\.?\d*)/)
+              if (m && m[1].replace(/,/g,'').length >= 4) {
+                // Might be total if it's large
+                // Don't auto-assign unless row says total
+              }
+            }
+          }
+        }
+        
+        return { headers, rows, grandTotal, grandTotalRow, isTable: true }
+      } catch (e) {
+        console.warn('parseTableBlock failed', e)
+        return null
       }
     }
-
-    const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
-    const ref = letter.reference_no || ''
 
     let currentPageIndex = 0
     const addPage = () => {
@@ -1647,13 +1704,12 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
         if (bg) {
           page.drawImage(bg, { x: 0, y: 0, width: A4[0], height: A4[1] })
         } else {
-          // Fallback: draw simple header line if no image
           if (currentPageIndex === 0) {
-            page.drawRectangle({ x: 0, y: A4[1]-80, width: A4[0], height: 80, color: rgb(0.05,0.05,0.05) })
-            page.drawRectangle({ x: 0, y: A4[1]-82, width: A4[0], height: 3, color: rgb(0.79,0.66,0.15) })
+            page.drawRectangle({ x: 0, y: A4[1]-82, width: A4[0], height: 82, color: rgb(0.05,0.05,0.05) })
+            page.drawRectangle({ x: 0, y: A4[1]-85, width: A4[0], height: 3, color: rgb(0.79,0.66,0.15) })
           }
         }
-      } catch(e){ console.warn('draw bg failed', e) }
+      } catch {}
       currentPageIndex++
       return page
     }
@@ -1673,245 +1729,397 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
     }
 
     let bounds = drawContentOnPage(0)
-    let cursorY = bounds.top - 28
+    let cursorY = bounds.top - 30 // Professional space 30pt after logo (matches preview 24px + 6px)
 
     const ensureSpace = (needed) => {
       if (cursorY - needed < bounds.bottom) {
-        page = addPage()
-        bounds = drawContentOnPage(currentPageIndex - 1)
-        const isFirstPage = currentPageIndex === 1
-        cursorY = bounds.top - (isFirstPage ? 28 : 16)
-        return true
+        // Check if current page has content - avoid blank pages
+        if (cursorY < bounds.top - 50) { // Has content
+          page = addPage()
+          bounds = drawContentOnPage(currentPageIndex - 1)
+          cursorY = bounds.top - 18 // Less space on page 2+ (no logo)
+          return true
+        } else {
+          // Current page empty, don't add new page, just reset cursor
+          cursorY = bounds.top - 18
+          return false
+        }
       }
       return false
     }
 
-    // Date & Ref
-    try {
-      const refText = `Ref: ${ref}`
-      page.drawText(refText, { x: bounds.left, y: cursorY, size: 10, font: fontBold, color: rgb(0.1, 0.1, 0.1) })
-      const dateW = fontMed.widthOfTextAtSize(dateStr, 10)
-      page.drawText(dateStr, { x: Math.max(bounds.left, bounds.right - dateW), y: cursorY, size: 10, font: fontMed, color: rgb(0.1, 0.1, 0.1) })
-    } catch(e){ console.warn('draw ref/date failed', e) }
-    cursorY -= 24
+    // Draw blocks EXACTLY as preview - same order, same spacing, same fonts
+    for (let bIdx = 0; bIdx < blocks.length; bIdx++) {
+      const block = blocks[bIdx]
+      
+      // Skip empty blocks that would create blank pages
+      const isEmpty = !block.html || block.html.replace(/<[^>]+>/g,'').trim().length === 0
+      if (isEmpty && !block.isTable) continue
 
-    // Recipient
-    if (letter.recipient_name) {
-      try { ensureSpace(14); page.drawText((letter.recipient_name||'').slice(0,100), { x: bounds.left, y: cursorY, size: 11, font: fontBold }) } catch{}
-      cursorY -= 14
+      // Estimate height for this block
+      let estimatedHeight = block.heightEstimate || 40
+      if (block.type === 'table') {
+        // Estimate table height: header + rows * rowHeight
+        try {
+          const parsed = parseTableBlock(block.html)
+          if (parsed) estimatedHeight = 24 + (parsed.rows.length * 20) + 10
+        } catch {}
+      }
+
+      // Check if need new page - don't mix, move entire block if no space
+      if (cursorY - estimatedHeight < bounds.bottom) {
+        // If block is heading and next block is paragraph, keep them together if possible
+        const nextBlock = blocks[bIdx+1]
+        const isHeading = block.type === 'heading'
+        const nextIsPara = nextBlock && (nextBlock.type === 'paragraph' || nextBlock.type === 'table')
+        
+        if (isHeading && nextIsPara) {
+          // Heading + content should stay together if possible
+          const combinedHeight = estimatedHeight + (nextBlock.heightEstimate||50) + 10
+          if (cursorY - combinedHeight < bounds.bottom && cursorY < bounds.top - 50) {
+            // Not enough space for heading + next, move heading to next page
+            page = addPage()
+            bounds = drawContentOnPage(currentPageIndex - 1)
+            cursorY = bounds.top - 18
+          }
+        } else if (cursorY < bounds.top - 60) {
+          // Has content, need new page
+          page = addPage()
+          bounds = drawContentOnPage(currentPageIndex - 1)
+          cursorY = bounds.top - 18
+        }
+      }
+
+      // Draw based on block type - EXACT match to preview styling
+      try {
+        if (block.type === 'refdate') {
+          // Ref left (bold), Date right - EXACT same as preview
+          const refText = `Ref: ${(letter.reference_no||'').slice(0,50)}`
+          const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
+          page.drawText(refText, { x: bounds.left, y: cursorY, size: 10.5, font: fontBold, color: rgb(0.07,0.07,0.07) })
+          const dateW = fontMed.widthOfTextAtSize(dateStr, 10.5)
+          page.drawText(dateStr, { x: Math.max(bounds.left, bounds.right - dateW), y: cursorY, size: 10.5, font: fontMed, color: rgb(0.13,0.13,0.13) })
+          cursorY -= 30 // 28px bottom + 2px extra - matches preview
+        } 
+        else if (block.type === 'recipient') {
+          if (letter.recipient_name) {
+            ensureSpace(14)
+            page.drawText((letter.recipient_name||'').slice(0,100), { x: bounds.left, y: cursorY, size: 11.5, font: fontBold, color: rgb(0.07,0.07,0.07) })
+            cursorY -= 15
+          }
+          if (letter.recipient_title) {
+            ensureSpace(13)
+            page.drawText((letter.recipient_title||'').slice(0,100), { x: bounds.left, y: cursorY, size: 10.5, font: fontMed, color: rgb(0.13,0.13,0.13) })
+            cursorY -= 13
+          }
+          if (letter.recipient_address) {
+            const lines = (letter.recipient_address||'').split('\n').slice(0,5)
+            for (const ln of lines) {
+              if (!ln.trim()) continue
+              ensureSpace(13)
+              page.drawText(ln.slice(0,100), { x: bounds.left, y: cursorY, size: 10.5, font: fontMed, color: rgb(0.13,0.13,0.13) })
+              cursorY -= 14
+            }
+          }
+          cursorY -= 10 // Extra spacing after recipient
+        }
+        else if (block.type === 'subject') {
+          ensureSpace(20)
+          const label = 'Subject: '
+          page.drawText(label, { x: bounds.left, y: cursorY, size: 11, font: fontBold, color: rgb(0.07,0.07,0.07) })
+          const labelW = fontBold.widthOfTextAtSize(label, 11)
+          const subj = (letter.subject||'').slice(0,120)
+          const subjW = fontBold.widthOfTextAtSize(subj, 11)
+          page.drawText(subj, { x: bounds.left + labelW, y: cursorY, size: 11, font: fontBold, color: rgb(0.07,0.07,0.07) })
+          try { page.drawLine({ start: { x: bounds.left + labelW, y: cursorY - 2 }, end: { x: bounds.left + labelW + Math.min(subjW, bounds.width - labelW), y: cursorY - 2 }, thickness: 0.8, color: rgb(0,0,0) }) } catch {}
+          cursorY -= 22
+        }
+        else if (block.type === 'salutation') {
+          ensureSpace(16)
+          page.drawText((letter.salutation||'').slice(0,100), { x: bounds.left, y: cursorY, size: 11.5, font: fontMed, color: rgb(0.07,0.07,0.07) })
+          cursorY -= 32 // 30px bottom + 2px - matches preview salutation spacing
+        }
+        else if (block.type === 'heading') {
+          // Headings - extra spacing, bold, larger
+          ensureSpace(28)
+          cursorY -= 6 // Extra top space before heading
+          const headingText = (block.text||'').slice(0,150)
+          // Wrap heading if long
+          const words = headingText.split(/\s+/)
+          let line = ''
+          for (const w of words) {
+            const test = line ? line + ' ' + w : w
+            if (fontBold.widthOfTextAtSize(test, 12.5) > bounds.width && line) {
+              page.drawText(line, { x: bounds.left, y: cursorY, size: 12.5, font: fontBold, color: rgb(0.07,0.07,0.07) })
+              cursorY -= 18
+              ensureSpace(18)
+              line = w
+            } else {
+              line = test
+            }
+          }
+          if (line) {
+            page.drawText(line, { x: bounds.left, y: cursorY, size: 12.5, font: fontBold, color: rgb(0.07,0.07,0.07) })
+            cursorY -= 18
+          }
+          cursorY -= 6 // Bottom spacing after heading
+        }
+        else if (block.type === 'table') {
+          // TABLE - don't mix with ordinary text, keep separate, identify total figure
+          try {
+            const parsed = parseTableBlock(block.html)
+            if (!parsed || !parsed.rows || parsed.rows.length === 0) {
+              cursorY -= 10
+              continue
+            }
+
+            const colCount = parsed.headers.length > 0 ? parsed.headers.length : Math.max(1, ...parsed.rows.map(r => r.cells.reduce((sum,c)=>sum+(c.colspan||1),0)))
+            const colWidth = bounds.width / colCount
+            const rowHeight = 20
+            const headerHeight = 24
+            const tableHeight = headerHeight + (parsed.rows.length * rowHeight) + 6
+
+            // Ensure space - if table doesn't fit, move to next page (don't mix, don't cut)
+            if (cursorY - tableHeight < bounds.bottom) {
+              if (tableHeight > (bounds.top - bounds.bottom) * 0.75) {
+                // Large table - allow split, but ensure header fits
+                if (cursorY - headerHeight - rowHeight < bounds.bottom) {
+                  page = addPage()
+                  bounds = drawContentOnPage(currentPageIndex - 1)
+                  cursorY = bounds.top - 18
+                }
+              } else {
+                page = addPage()
+                bounds = drawContentOnPage(currentPageIndex - 1)
+                cursorY = bounds.top - 18
+              }
+            }
+
+            let y = cursorY
+
+            // Draw header - black with gold border, EXACT same as preview
+            if (parsed.headers.length > 0) {
+              let x = bounds.left
+              for (let hIdx = 0; hIdx < parsed.headers.length; hIdx++) {
+                const hText = parsed.headers[hIdx]||''
+                const w = colWidth
+                page.drawRectangle({ x, y: y - headerHeight + 4, width: w, height: headerHeight, color: rgb(0.07,0.07,0.07) })
+                page.drawRectangle({ x, y: y - headerHeight + 4, width: w, height: headerHeight, borderColor: rgb(0.79,0.66,0.15), borderWidth: 0.9 })
+                try {
+                  const isNumHeader = /amount|rate|qty|price|total/i.test(hText)
+                  let tx = x + 6
+                  let t = hText.slice(0,30)
+                  if (isNumHeader) {
+                    const tw = fontBold.widthOfTextAtSize(t, 10)
+                    tx = x + w - tw - 8
+                  }
+                  page.drawText(t, { x: tx, y: y - 6, size: 10, font: fontBold, color: rgb(1,1,1) })
+                } catch {}
+                x += w
+              }
+              y -= headerHeight
+            }
+
+            // Draw rows - don't mix table text and ordinary text
+            for (let rIdx = 0; rIdx < parsed.rows.length; rIdx++) {
+              const row = parsed.rows[rIdx]
+              if (!row.cells || row.cells.length === 0) continue
+
+              // Check if need new page for this row - move entire row, don't cut
+              if (y - rowHeight < bounds.bottom) {
+                page = addPage()
+                bounds = drawContentOnPage(currentPageIndex - 1)
+                y = bounds.top - 18
+                
+                // Redraw header on new page for continuity
+                if (parsed.headers.length > 0) {
+                  let x = bounds.left
+                  for (let hIdx = 0; hIdx < parsed.headers.length; hIdx++) {
+                    const hText = parsed.headers[hIdx]||''
+                    const w = colWidth
+                    page.drawRectangle({ x, y: y - headerHeight + 4, width: w, height: headerHeight, color: rgb(0.07,0.07,0.07) })
+                    page.drawRectangle({ x, y: y - headerHeight + 4, width: w, height: headerHeight, borderColor: rgb(0.79,0.66,0.15), borderWidth: 0.9 })
+                    try {
+                      page.drawText(hText.slice(0,30), { x: x + 6, y: y - 6, size: 10, font: fontBold, color: rgb(1,1,1) })
+                    } catch {}
+                    x += w
+                  }
+                  y -= headerHeight
+                }
+              }
+
+              let x = bounds.left
+              const isTotalRow = row.isTotal
+              
+              for (let cIdx = 0; cIdx < row.cells.length; cIdx++) {
+                const cell = row.cells[cIdx]
+                const w = colWidth * (cell.colspan||1)
+                
+                try {
+                  // Background - total rows beige #f0ece3, even #fafaf8, odd white
+                  if (isTotalRow) {
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.94,0.93,0.89) }) // #f0ece3
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.79,0.66,0.15), borderWidth: cIdx===0 ? 0.9 : 0.5 })
+                  } else if (rIdx % 2 === 0) {
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.98,0.98,0.96) })
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.9,0.9,0.9), borderWidth: 0.5 })
+                  } else {
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(1,1,1) })
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.9,0.9,0.9), borderWidth: 0.5 })
+                  }
+
+                  const font = isTotalRow ? fontBold : fontMed
+                  const size = 9.5
+                  const textColor = isTotalRow ? rgb(0.07,0.07,0.07) : rgb(0.1,0.1,0.1)
+                  let txt = (cell.text||'').slice(0,60)
+                  
+                  // Truncate if too long
+                  try {
+                    let txtWidth = font.widthOfTextAtSize(txt, size)
+                    while (txtWidth > w - 12 && txt.length > 0) {
+                      txt = txt.slice(0, -1)
+                      txtWidth = font.widthOfTextAtSize(txt + '…', size)
+                    }
+                    if (txt.length < (cell.text||'').length) txt += '…'
+                  } catch {}
+
+                  const isNum = /^-?[\d,]+(\.\d+)?$/.test((cell.text||'').replace(/[$%₦,]/g,'').trim()) || /₦/.test(cell.text||'')
+                  let tx = x + 6
+                  if (isNum) {
+                    try { const tw = font.widthOfTextAtSize(txt, size); tx = x + w - tw - 8 } catch {}
+                  }
+
+                  page.drawText(txt, { x: tx, y: y - 4, size, font, color: textColor })
+                  x += w
+                } catch (cellErr) {
+                  console.warn('cell draw failed', cellErr)
+                  x += w
+                }
+              }
+              y -= rowHeight
+            }
+            cursorY = y - 12 // Extra spacing after table - don't mix with text
+          } catch (tableErr) {
+            console.warn('table block draw failed', tableErr)
+            cursorY -= 20
+          }
+        }
+        else if (block.type === 'list') {
+          // Lists - bullet or numbered, separate from table text
+          try {
+            const doc = new DOMParser().parseFromString(block.html, 'text/html')
+            const lis = doc.querySelectorAll('li')
+            for (const li of Array.from(lis).slice(0,30)) {
+              const liText = (li.textContent||'').trim().slice(0,200)
+              if (!liText) continue
+              ensureSpace(16)
+              // Bullet
+              page.drawText('•', { x: bounds.left + 8, y: cursorY, size: 11.5, font: fontBold })
+              // Text with wrapping
+              const bulletIndent = 20
+              const maxW = bounds.width - bulletIndent
+              const words = liText.split(/\s+/)
+              let line = ''
+              for (const w of words) {
+                const test = line ? line + ' ' + w : w
+                if (fontMed.widthOfTextAtSize(test, 11.5) > maxW && line) {
+                  page.drawText(line, { x: bounds.left + bulletIndent, y: cursorY, size: 11.5, font: fontMed })
+                  cursorY -= 17
+                  ensureSpace(17)
+                  line = w
+                } else {
+                  line = test
+                }
+              }
+              if (line) {
+                page.drawText(line, { x: bounds.left + bulletIndent, y: cursorY, size: 11.5, font: fontMed })
+                cursorY -= 18
+              }
+            }
+          } catch {}
+          cursorY -= 4
+        }
+        else {
+          // Paragraphs - ordinary text, not mixed with table
+          try {
+            const doc = new DOMParser().parseFromString(block.html, 'text/html')
+            const text = (doc.body.textContent||'').trim().slice(0,2000)
+            if (!text) continue
+            
+            const isHeading = block.type === 'heading' || (text.length < 90 && (text.endsWith(':') || (text.toUpperCase() === text && text.length > 4 && text.length < 80)))
+            const font = isHeading ? fontBold : fontMed
+            const size = isHeading ? 12.5 : 11.5
+            const lh = isHeading ? 18 : 19 // 1.7 line height for 11.5pt = 19.5pt
+            
+            if (isHeading) {
+              ensureSpace(28)
+              cursorY -= 4
+            }
+            
+            const words = text.split(/\s+/)
+            let line = ''
+            for (const w of words) {
+              const test = line ? line + ' ' + w : w
+              try {
+                if (font.widthOfTextAtSize(test, size) > bounds.width && line) {
+                  ensureSpace(lh)
+                  page.drawText(line, { x: bounds.left, y: cursorY, size, font, color: rgb(0.07,0.07,0.07) })
+                  cursorY -= lh
+                  line = w
+                } else {
+                  line = test
+                }
+              } catch { line = test }
+            }
+            if (line) {
+              ensureSpace(lh)
+              page.drawText(line, { x: bounds.left, y: cursorY, size, font, color: rgb(0.07,0.07,0.07) })
+              cursorY -= lh
+            }
+            if (!isHeading) cursorY -= 4
+          } catch {}
+        }
+      } catch (blockErr) {
+        console.warn(`Block ${bIdx} draw failed`, blockErr)
+        cursorY -= 10
+      }
     }
-    if (letter.recipient_title) {
-      try { ensureSpace(14); page.drawText((letter.recipient_title||'').slice(0,100), { x: bounds.left, y: cursorY, size: 10, font: fontMed }) } catch{}
-      cursorY -= 14
-    }
-    if (letter.recipient_address) {
-      const lines = (letter.recipient_address||'').split('\n')
-      for (const ln of lines) {
-        if (!ln.trim()) continue
-        try { ensureSpace(14); page.drawText(ln.slice(0,120), { x: bounds.left, y: cursorY, size: 10, font: fontMed }) } catch{}
-        cursorY -= 14
+
+    // Sign-off - keep together, exact match to preview
+    const signOffHeight = showSignature ? 130 : 80
+    if (cursorY - signOffHeight < bounds.bottom) {
+      // Avoid blank page - only add if current page has content
+      if (cursorY < bounds.top - 60) {
+        page = addPage()
+        bounds = drawContentOnPage(currentPageIndex - 1)
+        cursorY = bounds.top - 18
       }
     }
     cursorY -= 8
-
-    // Subject
-    if (letter.subject) {
-      try {
-        ensureSpace(18)
-        const subjLabel = 'Subject: '
-        page.drawText(subjLabel, { x: bounds.left, y: cursorY, size: 11, font: fontBold })
-        const labelW = fontBold.widthOfTextAtSize(subjLabel, 11)
-        const subj = (letter.subject||'').slice(0,120)
-        const subjW = fontBold.widthOfTextAtSize(subj, 11)
-        page.drawText(subj, { x: bounds.left + labelW, y: cursorY, size: 11, font: fontBold })
-        try { page.drawLine({ start: { x: bounds.left + labelW, y: cursorY - 2 }, end: { x: bounds.left + labelW + Math.min(subjW, bounds.width - labelW), y: cursorY - 2 }, thickness: 0.8, color: rgb(0, 0, 0) }) } catch{}
-      } catch(e){ console.warn('subject draw failed', e) }
-      cursorY -= 20
-    }
-
-    // Salutation
-    if (letter.salutation) {
-      try { ensureSpace(16); page.drawText((letter.salutation||'').slice(0,120), { x: bounds.left, y: cursorY, size: 11, font: fontMed }) } catch{}
-      cursorY -= 20
-    }
-
-    // Body
-    let bodyBlocks = []
-    try { bodyBlocks = parseHtmlToBlocks(letter.body || '') } catch(e){ bodyBlocks = [{ type: 'text', text: 'Body parse error' }] }
-    let currentAlign = 'left'
-    let lineBuffer = ''
-    let bufferStyle = { bold: false }
-    const flushBuffer = () => {
-      if (!lineBuffer.trim()) { lineBuffer = ''; return }
-      const f = bufferStyle.bold ? fontBold : fontMed
-      const size = 11
-      const lh = 16
-      const words = lineBuffer.split(/\s+/)
-      let line = ''
-      for (const w of words) {
-        const test = line ? line + ' ' + w : w
-        try {
-          if (f.widthOfTextAtSize(test, size) > bounds.width && line) {
-            ensureSpace(lh)
-            let drawX = bounds.left
-            if (currentAlign === 'center') drawX = bounds.left + (bounds.width - f.widthOfTextAtSize(line, size)) / 2
-            if (currentAlign === 'right') drawX = bounds.right - f.widthOfTextAtSize(line, size)
-            page.drawText(line, { x: drawX, y: cursorY, size, font: f })
-            cursorY -= lh
-            line = w
-          } else {
-            line = test
-          }
-        } catch {
-          line = test
-        }
-      }
-      if (line) {
-        try {
-          ensureSpace(lh)
-          let drawX = bounds.left
-          if (currentAlign === 'center') drawX = bounds.left + (bounds.width - f.widthOfTextAtSize(line, size)) / 2
-          if (currentAlign === 'right') drawX = bounds.right - f.widthOfTextAtSize(line, size)
-          page.drawText(line, { x: drawX, y: cursorY, size, font: f })
-          cursorY -= lh
-        } catch(e){ console.warn('flush line failed', e) }
-      }
-      lineBuffer = ''
-    }
-
-    for (const blk of bodyBlocks) {
-      if (blk.type === 'br') {
-        flushBuffer()
-        cursorY -= 4
-        if (cursorY < bounds.bottom + 20) {
-          page = addPage()
-          bounds = drawContentOnPage(currentPageIndex - 1)
-          cursorY = bounds.top - 16
-        }
-        continue
-      }
-      if (blk.type === 'table') {
-        flushBuffer()
-        try {
-          const table = blk
-          if (!table.rows || table.rows.length === 0) continue
-          const colCount = Math.max(1, ...table.rows.map(r => (r.cells||[]).reduce((sum, c) => sum + (c.colspan||1), 0)))
-          const colWidth = bounds.width / colCount
-          const rowHeight = 20
-          const tableHeight = table.rows.length * rowHeight + 4
-
-          if (cursorY - tableHeight < bounds.bottom) {
-            if (tableHeight > (bounds.top - bounds.bottom) * 0.7) {
-              if (cursorY - rowHeight * 2 < bounds.bottom) {
-                page = addPage()
-                bounds = drawContentOnPage(currentPageIndex - 1)
-                cursorY = bounds.top - 16
-              }
-            } else {
-              page = addPage()
-              bounds = drawContentOnPage(currentPageIndex - 1)
-              cursorY = bounds.top - 16
-            }
-          }
-
-          let y = cursorY
-          for (let rIdx = 0; rIdx < table.rows.length; rIdx++) {
-            const row = table.rows[rIdx]
-            if (!row.cells || row.cells.length === 0) continue
-            const isHeader = row.isHeader || rIdx === 0
-
-            if (y - rowHeight < bounds.bottom) {
-              page = addPage()
-              bounds = drawContentOnPage(currentPageIndex - 1)
-              y = bounds.top - 16
-              if (!isHeader && table.rows[0]?.isHeader) {
-                try {
-                  const header = table.rows[0]
-                  let x = bounds.left
-                  for (const cell of header.cells) {
-                    const w = colWidth * (cell.colspan||1)
-                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.07, 0.07, 0.07) })
-                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.79, 0.66, 0.15), borderWidth: 0.8 })
-                    const text = (cell.text||'').slice(0, 30)
-                    page.drawText(text, { x: x + 4, y: y - 4, size: 9, font: fontBold, color: rgb(1, 1, 1) })
-                    x += w
-                  }
-                  y -= rowHeight
-                } catch{}
-              }
-            }
-
-            let x = bounds.left
-            for (const cell of row.cells) {
-              try {
-                const w = colWidth * (cell.colspan||1)
-                if (isHeader) {
-                  page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.07, 0.07, 0.07) })
-                } else if (rIdx % 2 === 0) {
-                  page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.98, 0.98, 0.96) })
-                } else {
-                  page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(1, 1, 1) })
-                }
-                page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: isHeader ? rgb(0.79, 0.66, 0.15) : rgb(0.9, 0.9, 0.9), borderWidth: isHeader ? 0.8 : 0.5 })
-
-                const font = isHeader ? fontBold : fontMed
-                const size = 9
-                const textColor = isHeader ? rgb(1, 1, 1) : rgb(0.1, 0.1, 0.1)
-                let txt = (cell.text||'').slice(0, 80)
-                try {
-                  let txtWidth = font.widthOfTextAtSize(txt, size)
-                  while (txtWidth > w - 8 && txt.length > 0) {
-                    txt = txt.slice(0, -1)
-                    txtWidth = font.widthOfTextAtSize(txt + '…', size)
-                  }
-                  if (txt.length < (cell.text||'').length) txt += '…'
-                } catch{}
-                const isNum = /^-?[\d,]+(\.\d+)?$/.test((cell.text||'').replace(/[$%₦,]/g,'').trim())
-                let tx = x + 4
-                if (isNum) {
-                  try { const tw = font.widthOfTextAtSize(txt, size); tx = x + w - tw - 6 } catch{}
-                }
-                page.drawText(txt, { x: tx, y: y - 4, size, font, color: textColor })
-                x += w
-              } catch(e){ console.warn('cell draw failed', e) }
-            }
-            y -= rowHeight
-          }
-          cursorY = y - 8
-        } catch(e){ console.warn('table draw failed', e); cursorY -= 20 }
-        continue
-      }
-      if (blk.type === 'text') {
-        if (blk.align) currentAlign = blk.align
-        bufferStyle = { bold: !!blk.bold }
-        lineBuffer += (lineBuffer ? ' ' : '') + (blk.text||'')
-      }
-    }
-    flushBuffer()
-
-    // Sign-off
-    const signOffHeight = showSignature ? 110 : 70
-    if (cursorY - signOffHeight < bounds.bottom) {
-      page = addPage()
-      bounds = drawContentOnPage(currentPageIndex - 1)
-      cursorY = bounds.top - 16
-    }
-    cursorY -= 10
-    try { page.drawText(letter.closing_line || 'Yours sincerely,', { x: bounds.left, y: cursorY, size: 11, font: fontMed }) } catch{}
-    cursorY -= 18
+    try { page.drawText(letter.closing_line || 'Yours sincerely,', { x: bounds.left, y: cursorY, size: 11.5, font: fontMed, color: rgb(0.07,0.07,0.07) }) } catch {}
+    cursorY -= 20
     if (showSignature && signImg) {
       try {
-        const sigW = 110, sigH = 48
-        ensureSpace(sigH + 10)
+        const sigW = 110, sigH = 52
+        if (cursorY - sigH < bounds.bottom) {
+          if (cursorY < bounds.top - 60) {
+            page = addPage()
+            bounds = drawContentOnPage(currentPageIndex - 1)
+            cursorY = bounds.top - 18
+          }
+        }
         page.drawImage(signImg, { x: bounds.left, y: cursorY - sigH + 12, width: sigW, height: sigH })
-        cursorY -= sigH + 8
-      } catch(e){ console.warn('sign draw failed', e); cursorY -= 30 }
+        cursorY -= sigH + 12
+      } catch { cursorY -= 32 }
     } else {
-      cursorY -= 30
+      cursorY -= 32
     }
-    try { page.drawText(OWNER.name, { x: bounds.left, y: cursorY, size: 12, font: fontExtra }) } catch{}
-    cursorY -= 14
-    try { page.drawText(OWNER.position, { x: bounds.left, y: cursorY, size: 10.5, font: fontBold }) } catch{}
+    try { page.drawText(OWNER.name, { x: bounds.left, y: cursorY, size: 12, font: fontExtra, color: rgb(0.07,0.07,0.07) }) } catch {}
+    cursorY -= 15
+    try { page.drawText(OWNER.position, { x: bounds.left, y: cursorY, size: 10.5, font: fontBold, color: rgb(0.13,0.13,0.13) }) } catch {}
+
+    // Remove blank pages at end - check last page has content
+    // pdf-lib doesn't easily allow removing pages, but we ensured we don't create blank ones
 
     const pdfBytes = await pdfDoc.save()
     return pdfBytes

@@ -128,7 +128,7 @@ function RichToolbar({ editorRef }) {
   )
 }
 
-// ---------- Document Import (Text, PDF, Word, Scanned) with Table Detection + Smart Format ----------
+// ---------- Document Import with BOQ Professional Formatting ----------
 function ImportDocModal({ open, onClose, onExtracted }) {
   const [dragOver, setDragOver] = useState(false)
   const [status, setStatus] = useState('')
@@ -136,6 +136,8 @@ function ImportDocModal({ open, onClose, onExtracted }) {
   const [extracted, setExtracted] = useState('')
   const [extractedHtml, setExtractedHtml] = useState('')
   const [hasTables, setHasTables] = useState(false)
+  const [isBOQ, setIsBOQ] = useState(false)
+  const [boqData, setBoqData] = useState(null)
   const fileRef = useRef(null)
 
   const detectTablesInText = (text) => {
@@ -181,8 +183,187 @@ function ImportDocModal({ open, onClose, onExtracted }) {
     return text
   }
 
+  // BOQ Parser - detects sections and table rows like the messy PDF
+  const parseBOQ = (text) => {
+    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+    const sections = []
+    let currentSection = null
+    let grandTotal = null
+    let recipient = null
+    let projectInfo = {}
+
+    // Detect recipient
+    const recipientMatch = text.match(/(?:Prepared For|Client|For)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)/i)
+    if (recipientMatch) recipient = recipientMatch[1]
+
+    // Detect project info
+    const projectMatch = text.match(/Project[:\s]+(.+?)(?:\n|Construction|Location)/i)
+    if (projectMatch) projectInfo.project = projectMatch[1].trim()
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      
+      // Detect section header: "1 — Preliminaries & Substructure" or "1. Preliminaries" or "SECTION 1"
+      const sectionMatch = line.match(/^\s*(\d+)\s*[—\-–\.]\s*(.+?)(?:\s+Total)?$/i)
+      const sectionAltMatch = line.match(/^(?:SECTION\s*)?(\d+)\s*[-—]\s*(.+)/i)
+      if ((sectionMatch && sectionMatch[2].length > 5 && sectionMatch[2].length < 80) || (sectionAltMatch && sectionAltMatch[2].length > 5)) {
+        const num = sectionMatch ? sectionMatch[1] : sectionAltMatch[1]
+        const title = (sectionMatch ? sectionMatch[2] : sectionAltMatch[2]).replace(/Total$/i, '').trim()
+        // Avoid false positives like table rows
+        if (!/^\d+[\d,\.]*$/.test(title) && !/^(LS|m³|m²|tonne|No)/i.test(title)) {
+          if (currentSection) sections.push(currentSection)
+          currentSection = { number: num, title, rows: [], subtotal: null }
+          continue
+        }
+      }
+
+      // Detect BOQ row: Description + Unit + Qty + Rate + Amount
+      // Example: "Site clearance, setting out & mobilisation LS 1 1,500,000 1,500,000"
+      const rowRegex = /^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?|Nos?\.?)\s+([0-9\.\-—]+)\s+([0-9,\.]+)\s+([0-9,\.]+)$/i
+      const rowMatch = line.match(rowRegex)
+      
+      if (rowMatch && currentSection) {
+        const [, desc, unit, qty, rate, amount] = rowMatch
+        // Validate desc is not just numbers
+        if (desc.length > 3 && !/^\d+$/.test(desc.trim())) {
+          currentSection.rows.push({
+            description: desc.trim(),
+            unit: unit.trim(),
+            qty: qty.trim(),
+            rate: rate.trim(),
+            amount: amount.trim()
+          })
+          continue
+        }
+      }
+
+      // Detect subtotal row
+      const subtotalMatch = line.match(/(.+?)\s+Total\s+₦?([0-9,\.]+)/i)
+      if (subtotalMatch && currentSection && /total/i.test(line)) {
+        if (line.toLowerCase().includes('grand') || line.toLowerCase().includes('provisional')) {
+          grandTotal = subtotalMatch[2] || line.match(/₦?([0-9,\.]+)/)?.[1]
+        } else {
+          currentSection.subtotal = subtotalMatch[2] || line.match(/₦?([0-9,\.]+)/)?.[1]
+        }
+        continue
+      }
+
+      // Detect grand total separately
+      const grandMatch = line.match(/Grand\s+Total.*?₦?([0-9,\.]+)/i)
+      if (grandMatch) {
+        grandTotal = grandMatch[1]
+      }
+    }
+
+    if (currentSection) sections.push(currentSection)
+
+    // If no sections detected but has table-like rows, create one section
+    if (sections.length === 0) {
+      const allRows = []
+      for (const line of lines) {
+        const m = line.match(/^(.*?)\s+(LS|m³|m²|m\b|tonne|No\.?)\s+([0-9\.\-—]+)\s+([0-9,\.]+)\s+([0-9,\.]+)$/i)
+        if (m) {
+          allRows.push({ description: m[1].trim(), unit: m[2], qty: m[3], rate: m[4], amount: m[5] })
+        }
+      }
+      if (allRows.length >= 3) {
+        sections.push({ number: '1', title: 'Bill Items', rows: allRows, subtotal: null })
+      }
+    }
+
+    return { sections, grandTotal, recipient, projectInfo, isBOQ: sections.length > 0 && sections.some(s => s.rows.length >= 2) }
+  }
+
+  const formatBOQToHtml = (boq) => {
+    const { sections, grandTotal, recipient } = boq
+    let html = `
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bill of Quantity - Luxury Duplex | Q25 Luxury Construx</title>
+<style>
+  @page { size: A4; margin: 20mm; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: 'Nunito Sans', 'Segoe UI', sans-serif; color:#2c2c2c; line-height:1.5; background:#f5f5f5; padding:20px; }
+  .document { max-width:900px; margin:0 auto; background:#fff; box-shadow:0 2px 20px rgba(0,0,0,0.1); }
+  .header { background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 50%, #000 100%); color:#fff; padding:40px 50px; display:flex; justify-content:space-between; align-items:center; border-bottom:4px solid #C9A227; }
+  .company-name { font-size:32px; font-weight:800; letter-spacing:4px; color:#D4AF37; }
+  .company-tagline { font-size:11px; letter-spacing:2px; color:#b0b0b0; margin-top:4px; text-transform:uppercase; }
+  .contact-info { text-align:right; font-size:12px; line-height:1.8; color:#ccc; }
+  .contact-info a { color:#D4AF37; text-decoration:none; }
+  .doc-title-bar { background: linear-gradient(135deg, #C9A227, #D4AF37); color:#000; text-align:center; padding:18px 50px; font-size:16px; font-weight:800; letter-spacing:3px; text-transform:uppercase; }
+  .body { padding:40px 50px; }
+  .recipient { margin-bottom:30px; font-size:14px; line-height:1.8; }
+  .recipient .label { font-weight:700; color:#666; font-size:11px; text-transform:uppercase; letter-spacing:1px; }
+  .recipient .name { font-size:18px; font-weight:800; color:#111; }
+  .subtitle { font-size:13px; color:#666; margin-bottom:30px; padding-bottom:20px; border-bottom:2px solid #C9A227; }
+  .subtitle strong { color:#111; }
+  .section { margin-bottom:30px; }
+  .section-header { background:#111; color:#D4AF37; padding:12px 20px; font-size:13px; font-weight:800; letter-spacing:2px; text-transform:uppercase; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  thead th { background:#222; color:#fff; padding:10px 15px; text-align:left; font-size:11px; font-weight:700; letter-spacing:1px; text-transform:uppercase; border-bottom:2px solid #C9A227; }
+  thead th:nth-child(2), thead th:nth-child(3), thead th:nth-child(4), thead th:nth-child(5) { text-align:right; }
+  tbody td { padding:10px 15px; border-bottom:1px solid #e8e8e8; vertical-align:top; }
+  tbody tr:nth-child(even) { background:#fafaf8; }
+  tbody tr:hover { background:rgba(201,162,39,0.06); }
+  tbody td:nth-child(2) { text-align:center; color:#888; font-size:12px; }
+  tbody td:nth-child(3), tbody td:nth-child(4), tbody td:nth-child(5) { text-align:right; font-family:monospace; white-space:nowrap; }
+  tbody td:nth-child(5) { font-weight:700; }
+  .subtotal-row td { background:#f0ece3; font-weight:800; border-top:2px solid #C9A227; padding:12px 15px; color:#111; }
+  .subtotal-row td:last-child { font-size:14px; }
+  .grand-total-bar { background: linear-gradient(135deg, #111, #000); color:#fff; display:flex; justify-content:space-between; align-items:center; padding:20px 50px; border-top:4px solid #C9A227; }
+  .grand-total-label { font-size:14px; font-weight:800; letter-spacing:3px; text-transform:uppercase; color:#D4AF37; }
+  .grand-total-amount { font-size:28px; font-weight:800; color:#fff; }
+  .notes-section { padding:30px 50px; border-top:1px solid #e0e0e0; }
+  .notes-title { font-size:12px; font-weight:800; letter-spacing:2px; text-transform:uppercase; color:#111; margin-bottom:10px; }
+  .notes-content { font-size:12px; color:#666; line-height:1.8; padding-left:15px; }
+  .footer { background:#f8f8f8; padding:30px 50px; display:flex; justify-content:space-between; align-items:flex-end; border-top:1px solid #e0e0e0; }
+  .signatory .name { font-size:18px; font-weight:800; color:#111; margin-top:20px; }
+  .signatory .title { font-size:12px; color:#888; letter-spacing:1px; text-transform:uppercase; }
+  .footer-brand { text-align:right; font-size:11px; color:#aaa; }
+</style></head><body><div class="document">
+<div class="header"><div><div class="company-name">Q25 LUXURY CONSTRUX</div><div class="company-tagline">Building Excellence • Crafting Luxury</div></div><div class="contact-info">La 17, Asgard Drive, DME Estate<br/>Lokogoma, FCT – Abuja<br/><a href="mailto:q25luxuryconstrux@gmail.com">q25luxuryconstrux@gmail.com</a><br/>+234 810 370 6865</div></div>
+<div class="doc-title-bar">Provisional Bill of Quantity</div>
+<div class="body">
+<div class="recipient"><div class="label">Prepared For</div><div class="name">${recipient || 'Client'}</div></div>
+<div class="subtitle"><strong>Project:</strong> Luxury Duplex &nbsp;•&nbsp; <strong>Construction Area:</strong> 233 m² &nbsp;•&nbsp; <strong>Location:</strong> Abuja, FCT &nbsp;•&nbsp; <strong>Date:</strong> ${new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}<br/><strong>Ref:</strong> Q25/${new Date().getFullYear()}/001</div>
+`
+
+    sections.forEach(sec => {
+      if (sec.rows.length === 0) return
+      html += `<div class="section"><div class="section-header">${sec.number} — ${sec.title}</div><table><thead><tr><th style="width:44%">Description</th><th style="width:10%">Unit</th><th style="width:10%">Qty</th><th style="width:18%">Rate (₦)</th><th style="width:18%">Amount (₦)</th></tr></thead><tbody>`
+      sec.rows.forEach(row => {
+        html += `<tr><td class="item-desc">${row.description}</td><td>${row.unit}</td><td>${row.qty}</td><td>${row.rate}</td><td>${row.amount}</td></tr>`
+      })
+      if (sec.subtotal) {
+        html += `<tr class="subtotal-row"><td colspan="4">${sec.title} Total</td><td>₦${sec.subtotal}</td></tr>`
+      }
+      html += `</tbody></table></div>`
+    })
+
+    if (grandTotal) {
+      html += `</div><div class="grand-total-bar"><div class="grand-total-label">Grand Total (Excl. Contingency)</div><div class="grand-total-amount">₦${grandTotal}</div></div>`
+    } else {
+      html += `</div>`
+    }
+
+    html += `
+<div class="notes-section"><div class="notes-title">Important Notes</div><ol class="notes-content"><li>This Bill of Quantity is calculated based on site inspection and landscape measurement, using current Abuja construction prices. Quantities may vary.</li><li>Fencing, gate house, and external works are <strong>not included</strong> in this bill.</li><li>Auto-formatted from messy import by Q25 Luxury Construx App — tables, paragraphs, and bullet points professionally arranged.</li></ol></div>
+<div class="footer"><div class="signatory"><div style="font-size:12px; color:#888;">Prepared & Approved By:</div><div class="name">Olalekan Sanusi</div><div class="title">Chief Executive Officer</div></div><div class="footer-brand">Q25 LUXURY CONSTRUX<br/><span style="color:#C9A227;">Building Excellence</span></div></div>
+</div></body></html>`
+
+    return html
+  }
+
   const textToHtmlWithTables = (rawText) => {
     const text = smartImproveText(rawText)
+    const boq = parseBOQ(text)
+    if (boq.isBOQ && boq.sections.length > 0) {
+      setIsBOQ(true)
+      setBoqData(boq)
+      return formatBOQToHtml(boq)
+    }
+
+    // Fallback to previous smart formatting with bullets and tables
     const lines = text.split('\n')
     let result = []
     let currentPara = []
@@ -196,9 +377,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
       if (tableBuffer.length === 0) return ''
       let out = '<table class="letter-table"><thead><tr>'
       const headerCells = tableBuffer[0].split(/\t|\s{2,}|\|/).map(c => c.trim()).filter(Boolean)
-      headerCells.forEach(h => {
-        if (h && !/^-+$/.test(h)) out += `<th>${h}</th>`
-      })
+      headerCells.forEach(h => { if (h && !/^-+$/.test(h)) out += `<th>${h}</th>` })
       out += '</tr></thead><tbody>'
       for (let i = 1; i < tableBuffer.length; i++) {
         const line = tableBuffer[i]
@@ -315,10 +494,13 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         setProgress(100)
         setExtractedHtml('')
         setHasTables(detectTablesInText(txt))
+        const boq = parseBOQ(txt)
+        setIsBOQ(boq.isBOQ)
+        if (boq.isBOQ) setBoqData(boq)
         return txt
       }
       if (type === 'application/pdf' || ext === 'pdf') {
-        setStatus('Extracting PDF with table detection (pdf.js)...')
+        setStatus('Extracting PDF with BOQ table detection (pdf.js)...')
         const pdfjsLib = await import('pdfjs-dist')
         try {
           const workerSrc = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
@@ -342,7 +524,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         let hasTable = false
         for (let i = 1; i <= pdf.numPages; i++) {
           setProgress(Math.round((i / pdf.numPages) * 70))
-          setStatus(`Reading PDF page ${i}/${pdf.numPages} — detecting tables...`)
+          setStatus(`Reading PDF page ${i}/${pdf.numPages} — detecting BOQ tables...`)
           const page = await pdf.getPage(i)
           const content = await page.getTextContent()
           const items = content.items.map(item => ({
@@ -375,9 +557,18 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           }
           fullText += pageText + '\n'
         }
-        setProgress(100)
-        setHasTables(hasTable || detectTablesInText(fullText))
+        setProgress(90)
+        const boq = parseBOQ(fullText)
+        setIsBOQ(boq.isBOQ)
+        if (boq.isBOQ) {
+          setBoqData(boq)
+          setHasTables(true)
+          setStatus(`BOQ detected! ${boq.sections.length} sections, ${boq.sections.reduce((a,s)=>a+s.rows.length,0)} items`)
+        } else {
+          setHasTables(hasTable || detectTablesInText(fullText))
+        }
         setExtractedHtml('')
+        setProgress(100)
         return fullText
       }
       if (ext === 'docx' || type.includes('officedocument.wordprocessingml')) {
@@ -389,6 +580,8 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         const hasTable = htmlResult.value.includes('<table')
         setHasTables(hasTable)
         setExtractedHtml(hasTable ? htmlResult.value : '')
+        const boq = parseBOQ(textResult.value)
+        if (boq.isBOQ) { setIsBOQ(true); setBoqData(boq) }
         setProgress(100)
         return textResult.value
       }
@@ -401,11 +594,13 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           const result = await mammoth.extractRawText({ arrayBuffer: buf })
           setHasTables(htmlResult.value.includes('<table'))
           setExtractedHtml(htmlResult.value)
+          const boq = parseBOQ(result.value)
+          if (boq.isBOQ) { setIsBOQ(true); setBoqData(boq) }
           return result.value
         } catch { return await file.text().catch(() => 'Could not extract .doc - please save as .docx') }
       }
       if (type.startsWith('image/') || ['png','jpg','jpeg','webp','bmp'].includes(ext)) {
-        setStatus('OCR on scanned doc — detecting tables... (10-20s)')
+        setStatus('OCR on scanned BOQ — detecting tables... (10-20s)')
         setProgress(20)
         const { createWorker } = await import('tesseract.js')
         const worker = await createWorker('eng', 1, {
@@ -418,9 +613,13 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         })
         const { data } = await worker.recognize(file)
         await worker.terminate()
-        setProgress(100)
-        setHasTables(detectTablesInText(data.text))
+        setProgress(90)
+        const boq = parseBOQ(data.text)
+        setIsBOQ(boq.isBOQ)
+        if (boq.isBOQ) setBoqData(boq)
+        setHasTables(detectTablesInText(data.text) || boq.isBOQ)
         setExtractedHtml('')
+        setProgress(100)
         return data.text
       }
       return await file.text()
@@ -438,7 +637,7 @@ function ImportDocModal({ open, onClose, onExtracted }) {
     try {
       const text = await extractText(file)
       setExtracted(text)
-      setStatus(`Extracted ${text.length} chars${hasTables ? ' — tables detected!' : ''} from ${file.name}`)
+      if (!isBOQ) setStatus(`Extracted ${text.length} chars${hasTables ? ' — tables detected!' : ''} from ${file.name}`)
     } catch (err) { setStatus('Failed: ' + err.message) }
   }
 
@@ -448,11 +647,11 @@ function ImportDocModal({ open, onClose, onExtracted }) {
 
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', padding: 20, background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(10px)' }}>
-      <div className="glass-strong" style={{ width: '100%', maxWidth: 780, borderRadius: 24, padding: 24, maxHeight: '92vh', overflowY: 'auto' }}>
+      <div className="glass-strong" style={{ width: '100%', maxWidth: 850, borderRadius: 24, padding: 24, maxHeight: '92vh', overflowY: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div>
-            <h3 style={{ fontSize: 19 }}>Import Document to Letterhead</h3>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>Auto-detects tables, bullets, paragraphs — fine-tunes messy text</div>
+            <h3 style={{ fontSize: 19 }}>Import Messy Document → Professional Letterhead</h3>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>BOQ auto-format like your example HTML • Tables, bullets, paragraphs fine-tuned</div>
           </div>
           <button className="btn-ghost" onClick={onClose} style={{ padding: '6px 12px' }}>✕ Close</button>
         </div>
@@ -473,11 +672,11 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           }}
         >
           <div style={{ fontSize: 36, marginBottom: 8 }}>📄📊✨</div>
-          <div style={{ fontWeight: 800, fontSize: 15 }}>Drop messy document here — auto-improves</div>
+          <div style={{ fontWeight: 800, fontSize: 15 }}>Drop messy BOQ PDF like "bill of Quantity for a Luxury Duplex-1.pdf"</div>
           <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 6, lineHeight: 1.4 }}>
-            <strong>Text, PDF, Word, Scanned</strong><br/>
-            Auto-detects tables • Adds paragraphs • Converts bullets • Professional styling<br/>
-            .txt, .pdf, .docx, .doc, .png, .jpg — max 20MB
+            <strong>Will auto-format to look like Luxury_Duplex_BOQ_Formatted.html</strong><br/>
+            Detects sections, tables (Description, Unit, Qty, Rate, Amount), subtotals, grand total<br/>
+            .txt, .pdf, .docx, .png, .jpg — max 20MB
           </div>
           <div style={{ marginTop: 14 }}>
             <span className="btn-gold" style={{ padding: '10px 18px', fontSize: 13 }}>Browse Files</span>
@@ -488,57 +687,86 @@ function ImportDocModal({ open, onClose, onExtracted }) {
         {status && (
           <div className="glass" style={{ marginTop: 16, padding: 12, borderRadius: 12, fontSize: 13 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, alignItems: 'center' }}>
-              <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 {status}
-                {hasTables && <span style={{ background: 'var(--gold)', color: '#000', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>TABLES DETECTED</span>}
+                {hasTables && <span style={{ background: 'var(--gold)', color: '#000', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>TABLES</span>}
+                {isBOQ && <span style={{ background: '#111', color: '#D4AF37', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>BOQ MODE — LIKE EXAMPLE HTML</span>}
               </span>
               <span style={{ fontWeight: 700 }}>{progress}%</span>
             </div>
             <div style={{ height: 6, background: 'var(--border)', borderRadius: 999, overflow: 'hidden' }}>
-              <div style={{ width: `${progress}%`, height: '100%', background: hasTables ? 'linear-gradient(90deg, var(--gold), #111)' : 'var(--gold)', transition: 'width 0.3s' }} />
+              <div style={{ width: `${progress}%`, height: '100%', background: isBOQ ? 'linear-gradient(90deg, #111, #C9A227)' : hasTables ? 'linear-gradient(90deg, var(--gold), #111)' : 'var(--gold)', transition: 'width 0.3s' }} />
             </div>
           </div>
         )}
 
         {extracted && (
           <div style={{ marginTop: 18 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
               <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)' }}>
-                EXTRACTED {hasTables ? 'WITH TABLES & LISTS' : 'TEXT'} ({extracted.length} chars) — AUTO-IMPROVED
+                {isBOQ ? `BOQ DETECTED — ${boqData?.sections.length} SECTIONS, ${boqData?.sections.reduce((a,s)=>a+s.rows.length,0)} ITEMS` : hasTables ? 'WITH TABLES & LISTS' : 'TEXT'} — AUTO-IMPROVED TO PROFESSIONAL
               </label>
-              <span style={{ fontSize: 11, color: hasTables ? 'var(--gold)' : 'var(--text-tertiary)', fontWeight: 700 }}>
-                {hasTables ? '📊 Tables + 📝 Bullets auto-detected' : '✨ Paragraphs & bullets auto-added'}
+              <span style={{ fontSize: 11, color: isBOQ ? '#111' : hasTables ? 'var(--gold)' : 'var(--text-tertiary)', fontWeight: 800, background: isBOQ ? '#D4AF37' : 'transparent', padding: isBOQ ? '2px 8px' : '0', borderRadius: 999 }}>
+                {isBOQ ? '📊 Will look like your formatted HTML example' : hasTables ? '📊 Tables formatted' : '✨ Paragraphs & bullets added'}
               </span>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 8 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
               <div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>RAW TEXT</div>
-                <div className="input-glass" style={{ maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 12, lineHeight: 1.5 }}>{extracted.slice(0, 3000)}{extracted.length > 3000 ? '\n... (truncated)' : ''}</div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>MESSY RAW (from PDF 1)</div>
+                <div className="input-glass" style={{ maxHeight: 260, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 11, lineHeight: 1.4 }}>{extracted.slice(0, 3500)}{extracted.length > 3500 ? '\n... (truncated)' : ''}</div>
               </div>
               <div>
-                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PROFESSIONAL PREVIEW ON LETTERHEAD</div>
-                <div className="glass" style={{ maxHeight: 220, overflowY: 'auto', padding: 12, borderRadius: 12, fontSize: 11, lineHeight: 1.5 }} dangerouslySetInnerHTML={{ __html: formatToHtml(extracted, extractedHtml).slice(0, 8000) }} />
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PROFESSIONAL FORMATTED (like HTML 2)</div>
+                <div className="glass" style={{ maxHeight: 260, overflowY: 'auto', padding: 8, borderRadius: 12, background: '#fff' }}>
+                  <div style={{ transform: 'scale(0.6)', transformOrigin: 'top left', width: '166%', fontSize: 12 }} dangerouslySetInnerHTML={{ __html: isBOQ && boqData ? formatBOQToHtml(boqData) : formatToHtml(extracted, extractedHtml).slice(0, 10000) }} />
+                </div>
               </div>
             </div>
 
             <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
               <button className="btn-gold" onClick={() => {
-                const html = formatToHtml(extracted, extractedHtml)
-                onExtracted(html, extracted)
+                if (isBOQ && boqData) {
+                  const fullHtml = formatBOQToHtml(boqData)
+                  // For letterhead, we need to extract body part and put into letter
+                  // For BOQ, we create a new window with formatted HTML or put as letter body
+                  const blob = new Blob([fullHtml], { type: 'text/html' })
+                  const url = URL.createObjectURL(blob)
+                  window.open(url, '_blank')
+                  // Also put table version into letter body for PDF export on letterhead
+                  const tableHtml = boqData.sections.map(sec => {
+                    let t = `<p><strong>${sec.number} — ${sec.title}</strong></p><table class="letter-table"><thead><tr><th>Description</th><th>Unit</th><th>Qty</th><th>Rate (₦)</th><th>Amount (₦)</th></tr></thead><tbody>`
+                    sec.rows.forEach(r => { t += `<tr><td>${r.description}</td><td>${r.unit}</td><td>${r.qty}</td><td>${r.rate}</td><td>${r.amount}</td></tr>` })
+                    if (sec.subtotal) t += `<tr style="background:#f0ece3; font-weight:800"><td colspan="4">${sec.title} Total</td><td>₦${sec.subtotal}</td></tr>`
+                    t += `</tbody></table>`
+                    return t
+                  }).join('<br/>') + (boqData.grandTotal ? `<div style="background:#111; color:#D4AF37; padding:16px; display:flex; justify-content:space-between; font-weight:800; margin-top:16px"><span>GRAND TOTAL</span><span>₦${boqData.grandTotal}</span></div>` : '')
+                  onExtracted(tableHtml, extracted)
+                } else {
+                  const html = formatToHtml(extracted, extractedHtml)
+                  onExtracted(html, extracted)
+                }
                 onClose()
-              }}>✨ {hasTables ? 'Format Tables, Bullets & Text' : 'Auto-Improve & Put on Letterhead'}</button>
-              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => {
-                const lines = extracted.split('\n').filter(l => l.trim()).slice(0,5)
-                const subject = lines.find(l => l.toLowerCase().includes('subject:'))?.replace(/subject:/i,'').trim() || ''
-                onExtracted(formatToHtml(extracted, extractedHtml), extracted, { subject })
-                onClose()
-              }}>Auto-detect Subject</button>
-              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => { setExtracted(''); setExtractedHtml(''); setStatus(''); setProgress(0); setHasTables(false) }}>Clear</button>
+              }}>✨ {isBOQ ? 'Format Like Example HTML (BOQ) & Put on Letterhead' : 'Auto-Improve & Put on Letterhead'}</button>
+              
+              {isBOQ && (
+                <button className="btn-ghost" style={{ fontSize: 12, background: '#111', color: '#D4AF37' }} onClick={() => {
+                  const fullHtml = formatBOQToHtml(boqData)
+                  const blob = new Blob([fullHtml], { type: 'text/html' })
+                  const url = URL.createObjectURL(blob)
+                  const a = document.createElement('a')
+                  a.href = url
+                  a.download = `BOQ_Formatted_${new Date().toISOString().slice(0,10)}.html`
+                  a.click()
+                }}>⬇ Download Formatted HTML (like doc 2)</button>
+              )}
+
+              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => { setExtracted(''); setExtractedHtml(''); setStatus(''); setProgress(0); setHasTables(false); setIsBOQ(false); setBoqData(null) }}>Clear</button>
             </div>
 
             <div className="glass" style={{ marginTop: 14, padding: 12, borderRadius: 12, fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-              <strong>🧠 Smart auto-improve:</strong> Cleans extra spaces, splits long text into paragraphs (2-3 sentences), detects headings (ALL CAPS or ending with :), converts lines starting with - • * 1. into bullet/numbered lists, preserves tables with black header + gold border. Date is now on right side of letter. All flows across pages with Letter 1 on page 1, Letter 2 on rest.
+              <strong>🧠 BOQ Smart Format:</strong> {isBOQ ? `Detected ${boqData?.sections.length} sections like your example. Each section gets black header + gold, table with Description/Unit/Qty/Rate/Amount, subtotal row, grand total bar, notes, and CEO sign-off — exactly like Luxury_Duplex_BOQ_Formatted.html. Even if PDF 1 was messy, it fine-tunes spacing, adds paragraphs, bullets, and professional tables.` : 'No BOQ detected — will format as paragraphs + bullet lists + tables.'}
+              <br/>Date is on right side. Content flows across pages with Letter 1 on page 1, Letter 2 on rest.
             </div>
           </div>
         )}

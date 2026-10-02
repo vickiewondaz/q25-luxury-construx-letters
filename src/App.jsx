@@ -161,10 +161,16 @@ function ImportDocModal({ open, onClose, onExtracted }) {
       }
       if (type === 'application/pdf' || ext === 'pdf') {
         setStatus('Extracting PDF (pdf.js)...')
-        const pdfjs = await import('pdfjs-dist')
-        // Use worker
-        const pdfjsLib = pdfjs.default || pdfjs
-        pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs`
+        const pdfjsLib = await import('pdfjs-dist')
+        // Fix: Use local worker to match API version (was 4.10.38 vs 4.4.168 mismatch)
+        try {
+          const workerSrc = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
+          pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc.default
+        } catch {
+          // Fallback to CDN with same version as API
+          const version = pdfjsLib.version || '4.10.38'
+          pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
+        }
         const buf = await file.arrayBuffer()
         const pdf = await pdfjsLib.getDocument({ data: buf }).promise
         let full = ''

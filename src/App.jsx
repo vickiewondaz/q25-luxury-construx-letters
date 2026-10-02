@@ -1300,417 +1300,417 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
   )
 }
 
-// ---------- PDF Export (lazy-loaded) ----------
+// ---------- PDF Export (lazy-loaded) - ROBUST FIX ----------
 async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature = true) {
-  const { PDFDocument, rgb, StandardFonts } = await import('pdf-lib')
-  const pdfDoc = await PDFDocument.create()
-  const A4 = [595.28, 841.89]
-
-  // Load fonts
-  const [medBytes, boldBytes, extraBytes] = await Promise.all([
-    fetch('/fonts/NunitoSans-Medium.ttf').then(r => r.arrayBuffer()).catch(() => null),
-    fetch('/fonts/NunitoSans-Bold.ttf').then(r => r.arrayBuffer()).catch(() => null),
-    fetch('/fonts/NunitoSans-ExtraBold.ttf').then(r => r.arrayBuffer()).catch(() => null),
-  ])
-  let fontMed, fontBold, fontExtra
   try {
-    fontMed = medBytes ? await pdfDoc.embedFont(medBytes) : await pdfDoc.embedFont(StandardFonts.Helvetica)
-    fontBold = boldBytes ? await pdfDoc.embedFont(boldBytes) : await pdfDoc.embedFont(StandardFonts.HelveticaBold)
-    fontExtra = extraBytes ? await pdfDoc.embedFont(extraBytes) : fontBold
-  } catch {
-    fontMed = await pdfDoc.embedFont(StandardFonts.Helvetica)
-    fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
-    fontExtra = fontBold
-  }
+    const { PDFDocument, rgb, StandardFonts } = await import('pdf-lib')
+    const pdfDoc = await PDFDocument.create()
+    const A4 = [595.28, 841.89]
 
-  const [letter1Bytes, letter2Bytes, signBytes] = await Promise.all([
-    fetch('/letter1.png').then(r => r.arrayBuffer()),
-    fetch('/letter2.png').then(r => r.arrayBuffer()),
-    showSignature ? fetch('/sign.png').then(r => r.arrayBuffer()).catch(() => null) : Promise.resolve(null)
-  ])
-  const letter1Img = await pdfDoc.embedPng(letter1Bytes)
-  const letter2Img = await pdfDoc.embedPng(letter2Bytes)
-  const signImg = signBytes ? await pdfDoc.embedPng(signBytes) : null
+    // Load fonts with robust fallback
+    let fontMed, fontBold, fontExtra
+    try {
+      const [medBytes, boldBytes, extraBytes] = await Promise.all([
+        fetch('/fonts/NunitoSans-Medium.ttf').then(r => { if (!r.ok) throw new Error('med font fetch failed'); return r.arrayBuffer() }).catch(() => null),
+        fetch('/fonts/NunitoSans-Bold.ttf').then(r => { if (!r.ok) throw new Error('bold font fetch failed'); return r.arrayBuffer() }).catch(() => null),
+        fetch('/fonts/NunitoSans-ExtraBold.ttf').then(r => { if (!r.ok) throw new Error('extra font fetch failed'); return r.arrayBuffer() }).catch(() => null),
+      ])
+      try {
+        fontMed = medBytes ? await pdfDoc.embedFont(medBytes) : await pdfDoc.embedFont(StandardFonts.Helvetica)
+      } catch { fontMed = await pdfDoc.embedFont(StandardFonts.Helvetica) }
+      try {
+        fontBold = boldBytes ? await pdfDoc.embedFont(boldBytes) : await pdfDoc.embedFont(StandardFonts.HelveticaBold)
+      } catch { fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold) }
+      try {
+        fontExtra = extraBytes ? await pdfDoc.embedFont(extraBytes) : fontBold
+      } catch { fontExtra = fontBold }
+    } catch (fontErr) {
+      console.warn('Font loading failed, using standard', fontErr)
+      fontMed = await pdfDoc.embedFont(StandardFonts.Helvetica)
+      fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
+      fontExtra = fontBold
+    }
 
-  const parseHtmlToBlocks = (html) => {
-    const doc = new DOMParser().parseFromString(html, 'text/html')
-    const blocks = []
-    const walk = (node, styles = {}) => {
-      if (node.nodeType === 3) {
-        const text = node.textContent
-        if (text && text.trim()) blocks.push({ type: 'text', text, ...styles })
-        return
+    // Load letterhead images with fallback - if fails, use blank
+    let letter1Img = null, letter2Img = null, signImg = null
+    try {
+      const [letter1Bytes, letter2Bytes] = await Promise.all([
+        fetch('/letter1.png').then(r => r.ok ? r.arrayBuffer() : null).catch(() => null),
+        fetch('/letter2.png').then(r => r.ok ? r.arrayBuffer() : null).catch(() => null),
+      ])
+      if (letter1Bytes) {
+        try { letter1Img = await pdfDoc.embedPng(letter1Bytes) } catch(e){ console.warn('letter1 embed failed', e) }
       }
-      if (node.nodeType !== 1) return
-      const tag = node.tagName.toLowerCase()
-      const newStyles = { ...styles }
-      if (['b', 'strong'].includes(tag)) newStyles.bold = true
-      if (['i', 'em'].includes(tag)) newStyles.italic = true
-      if (tag === 'u') newStyles.underline = true
-      if (tag === 'br') { blocks.push({ type: 'br' }); return }
-      if (tag === 'table') {
-        // Parse table professionally
-        const rows = []
-        const thead = node.querySelector('thead')
-        const tbody = node.querySelector('tbody') || node
-        const headerRows = thead ? Array.from(thead.querySelectorAll('tr')) : []
-        const bodyRows = Array.from(tbody.querySelectorAll('tr'))
+      if (letter2Bytes) {
+        try { letter2Img = await pdfDoc.embedPng(letter2Bytes) } catch(e){ console.warn('letter2 embed failed', e) }
+      }
+    } catch(e){ console.warn('letterhead fetch failed', e) }
 
-        const parseRow = (tr) => {
-          return Array.from(tr.querySelectorAll('th, td')).map(cell => ({
-            text: cell.textContent.trim(),
-            isHeader: cell.tagName.toLowerCase() === 'th',
-            colspan: parseInt(cell.getAttribute('colspan') || '1', 10)
-          }))
+    if (showSignature) {
+      try {
+        const signBytes = await fetch('/sign.png').then(r => r.ok ? r.arrayBuffer() : null).catch(() => null)
+        if (signBytes) {
+          try { signImg = await pdfDoc.embedPng(signBytes) } catch(e){ console.warn('sign embed failed', e) }
         }
+      } catch(e){ console.warn('sign fetch failed', e) }
+    }
 
-        if (headerRows.length) {
-          headerRows.forEach(tr => rows.push({ cells: parseRow(tr), isHeader: true }))
+    const parseHtmlToBlocks = (html) => {
+      try {
+        const doc = new DOMParser().parseFromString(html, 'text/html')
+        const blocks = []
+        const walk = (node, styles = {}) => {
+          if (node.nodeType === 3) {
+            const text = node.textContent
+            if (text && text.trim()) blocks.push({ type: 'text', text, ...styles })
+            return
+          }
+          if (node.nodeType !== 1) return
+          const tag = node.tagName.toLowerCase()
+          const newStyles = { ...styles }
+          if (['b', 'strong'].includes(tag)) newStyles.bold = true
+          if (['i', 'em'].includes(tag)) newStyles.italic = true
+          if (tag === 'u') newStyles.underline = true
+          if (tag === 'br') { blocks.push({ type: 'br' }); return }
+          if (tag === 'table') {
+            try {
+              const rows = []
+              const thead = node.querySelector('thead')
+              const tbody = node.querySelector('tbody') || node
+              const headerRows = thead ? Array.from(thead.querySelectorAll('tr')) : []
+              const bodyRows = Array.from(tbody.querySelectorAll('tr'))
+              const parseRow = (tr) => {
+                return Array.from(tr.querySelectorAll('th, td')).map(cell => ({
+                  text: (cell.textContent || '').trim().slice(0, 200),
+                  isHeader: cell.tagName.toLowerCase() === 'th',
+                  colspan: parseInt(cell.getAttribute('colspan') || '1', 10) || 1
+                }))
+              }
+              if (headerRows.length) {
+                headerRows.forEach(tr => { try{ rows.push({ cells: parseRow(tr), isHeader: true }) }catch{} })
+              }
+              bodyRows.forEach(tr => {
+                if (thead && thead.contains(tr)) return
+                try{ rows.push({ cells: parseRow(tr), isHeader: false }) }catch{}
+              })
+              if (rows.length) blocks.push({ type: 'table', rows })
+            } catch(e){ console.warn('table parse failed', e) }
+            return
+          }
+          if (tag === 'p' || tag === 'div') {
+            if (blocks.length && blocks[blocks.length - 1].type !== 'br') blocks.push({ type: 'br' })
+            const align = node.style?.textAlign || ''
+            if (align) newStyles.align = align
+            try{ Array.from(node.childNodes).forEach(c => walk(c, newStyles)) }catch{}
+            blocks.push({ type: 'br' })
+            if (tag === 'p') blocks.push({ type: 'br' })
+            return
+          }
+          if (tag === 'li') {
+            blocks.push({ type: 'text', text: '• ', ...newStyles })
+            try{ Array.from(node.childNodes).forEach(c => walk(c, newStyles)) }catch{}
+            blocks.push({ type: 'br' })
+            return
+          }
+          if (['ul', 'ol'].includes(tag)) {
+            try{ Array.from(node.childNodes).forEach(c => walk(c, newStyles)) }catch{}
+            return
+          }
+          try{ Array.from(node.childNodes).forEach(c => walk(c, newStyles)) }catch{}
         }
-        bodyRows.forEach(tr => {
-          // Skip if already counted as header and thead exists
-          if (thead && thead.contains(tr)) return
-          rows.push({ cells: parseRow(tr), isHeader: false })
-        })
-
-        if (rows.length) blocks.push({ type: 'table', rows })
-        return
-      }
-      if (tag === 'p' || tag === 'div') {
-        if (blocks.length && blocks[blocks.length - 1].type !== 'br') blocks.push({ type: 'br' })
-        const align = node.style.textAlign || ''
-        if (align) newStyles.align = align
-        Array.from(node.childNodes).forEach(c => walk(c, newStyles))
-        blocks.push({ type: 'br' })
-        if (tag === 'p') blocks.push({ type: 'br' })
-        return
-      }
-      if (tag === 'li') {
-        blocks.push({ type: 'text', text: '• ', ...newStyles })
-        Array.from(node.childNodes).forEach(c => walk(c, newStyles))
-        blocks.push({ type: 'br' })
-        return
-      }
-      if (['ul', 'ol'].includes(tag)) {
-        Array.from(node.childNodes).forEach(c => walk(c, newStyles))
-        return
-      }
-      Array.from(node.childNodes).forEach(c => walk(c, newStyles))
-    }
-    Array.from(doc.body.childNodes).forEach(n => walk(n, {}))
-    return blocks
-  }
-
-  const wrapAndDraw = (page, text, opts) => {
-    const { x, y, maxWidth, size, font, lineHeight, align } = opts
-    const words = text.split(/\s+/)
-    let line = ''
-    let curY = y
-    const lines = []
-    for (const w of words) {
-      const test = line ? line + ' ' + w : w
-      const wWidth = font.widthOfTextAtSize(test, size)
-      if (wWidth > maxWidth && line) {
-        lines.push(line)
-        line = w
-      } else {
-        line = test
+        Array.from(doc.body.childNodes).forEach(n => { try{ walk(n, {}) }catch{} })
+        return blocks
+      } catch(e){
+        console.warn('parseHtmlToBlocks failed', e)
+        return [{ type: 'text', text: (html || '').replace(/<[^>]+>/g, ' ').slice(0, 5000) }]
       }
     }
-    if (line) lines.push(line)
-    for (const l of lines) {
-      let drawX = x
-      const lineWidth = font.widthOfTextAtSize(l, size)
-      if (align === 'center') drawX = x + (maxWidth - lineWidth) / 2
-      if (align === 'right') drawX = x + (maxWidth - lineWidth)
-      if (align === 'justify' && lines.indexOf(l) !== lines.length - 1) {
-        // simple justify: spread words (approx)
+
+    const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
+    const ref = letter.reference_no || ''
+
+    let currentPageIndex = 0
+    const addPage = () => {
+      const page = pdfDoc.addPage(A4)
+      try {
+        const bg = currentPageIndex === 0 ? letter1Img : letter2Img
+        if (bg) {
+          page.drawImage(bg, { x: 0, y: 0, width: A4[0], height: A4[1] })
+        } else {
+          // Fallback: draw simple header line if no image
+          if (currentPageIndex === 0) {
+            page.drawRectangle({ x: 0, y: A4[1]-80, width: A4[0], height: 80, color: rgb(0.05,0.05,0.05) })
+            page.drawRectangle({ x: 0, y: A4[1]-82, width: A4[0], height: 3, color: rgb(0.79,0.66,0.15) })
+          }
+        }
+      } catch(e){ console.warn('draw bg failed', e) }
+      currentPageIndex++
+      return page
+    }
+
+    let page = addPage()
+    const getMarginsForPage = (idx) => idx === 0 ? margins.p1 : margins.p2
+    const pxToPt = (px) => px * (595.28 / 794)
+    const drawContentOnPage = (pIdx) => {
+      const m = getMarginsForPage(pIdx)
+      return {
+        left: pxToPt(m.left),
+        right: A4[0] - pxToPt(m.right),
+        top: A4[1] - pxToPt(m.top),
+        bottom: pxToPt(m.bottom),
+        width: A4[0] - pxToPt(m.left) - pxToPt(m.right)
       }
-      page.drawText(l, { x: drawX, y: curY, size, font, color: rgb(0.07, 0.07, 0.07) })
-      curY -= lineHeight
-      if (curY < 60) break
     }
-    return curY
-  }
 
-  // Build content blocks for pdf
-  const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
-  const ref = letter.reference_no || ''
-  const headerLines = [
-    { text: `${dateStr}    Ref: ${ref}`, bold: false, align: 'left', size: 9.5 },
-  ]
+    let bounds = drawContentOnPage(0)
+    let cursorY = bounds.top - 28
 
-  // We'll draw sequentially
-  let currentPageIndex = 0
-  const addPage = () => {
-    const page = pdfDoc.addPage(A4)
-    const bg = currentPageIndex === 0 ? letter1Img : letter2Img
-    page.drawImage(bg, { x: 0, y: 0, width: A4[0], height: A4[1] })
-    currentPageIndex++
-    return page
-  }
-
-  let page = addPage()
-  const getMarginsForPage = (idx) => idx === 0 ? margins.p1 : margins.p2
-  // Convert px margins (from 794x1123 preview) to PDF points (595x842)
-  const pxToPt = (px) => px * (595.28 / 794)
-  const drawContentOnPage = (pIdx, pg) => {
-    const m = getMarginsForPage(pIdx)
-    return {
-      left: pxToPt(m.left),
-      right: A4[0] - pxToPt(m.right),
-      top: A4[1] - pxToPt(m.top),
-      bottom: pxToPt(m.bottom),
-      width: A4[0] - pxToPt(m.left) - pxToPt(m.right)
+    const ensureSpace = (needed) => {
+      if (cursorY - needed < bounds.bottom) {
+        page = addPage()
+        bounds = drawContentOnPage(currentPageIndex - 1)
+        const isFirstPage = currentPageIndex === 1
+        cursorY = bounds.top - (isFirstPage ? 28 : 16)
+        return true
+      }
+      return false
     }
-  }
 
-  let bounds = drawContentOnPage(0, page)
-  // Professional space after logo - 28pt gap (was 10pt)
-  let cursorY = bounds.top - 28
+    // Date & Ref
+    try {
+      const refText = `Ref: ${ref}`
+      page.drawText(refText, { x: bounds.left, y: cursorY, size: 10, font: fontBold, color: rgb(0.1, 0.1, 0.1) })
+      const dateW = fontMed.widthOfTextAtSize(dateStr, 10)
+      page.drawText(dateStr, { x: Math.max(bounds.left, bounds.right - dateW), y: cursorY, size: 10, font: fontMed, color: rgb(0.1, 0.1, 0.1) })
+    } catch(e){ console.warn('draw ref/date failed', e) }
+    cursorY -= 24
 
-  // Helper to ensure space - no text cut, move to next page if needed
-  const ensureSpace = (needed) => {
-    if (cursorY - needed < bounds.bottom) {
-      page = addPage()
-      bounds = drawContentOnPage(currentPageIndex - 1, page)
-      // Professional space on new pages too, but less (no logo on page 2)
-      const isFirstPage = currentPageIndex === 1
-      cursorY = bounds.top - (isFirstPage ? 28 : 16)
-      return true
-    }
-    return false
-  }
-
-  // Date & Ref - Date on right side (per user request)
-  const refText = `Ref: ${ref}`
-  page.drawText(refText, { x: bounds.left, y: cursorY, size: 10, font: fontBold, color: rgb(0.1, 0.1, 0.1) })
-  const dateW = fontMed.widthOfTextAtSize(dateStr, 10)
-  page.drawText(dateStr, { x: bounds.right - dateW, y: cursorY, size: 10, font: fontMed, color: rgb(0.1, 0.1, 0.1) })
-  cursorY -= 24
-
-  // Recipient
-  if (letter.recipient_name) {
-    ensureSpace(14)
-    page.drawText(letter.recipient_name, { x: bounds.left, y: cursorY, size: 11, font: fontBold })
-    cursorY -= 14
-  }
-  if (letter.recipient_title) {
-    ensureSpace(14)
-    page.drawText(letter.recipient_title, { x: bounds.left, y: cursorY, size: 10, font: fontMed })
-    cursorY -= 14
-  }
-  if (letter.recipient_address) {
-    const lines = letter.recipient_address.split('\n')
-    for (const ln of lines) {
-      ensureSpace(14)
-      page.drawText(ln, { x: bounds.left, y: cursorY, size: 10, font: fontMed })
+    // Recipient
+    if (letter.recipient_name) {
+      try { ensureSpace(14); page.drawText((letter.recipient_name||'').slice(0,100), { x: bounds.left, y: cursorY, size: 11, font: fontBold }) } catch{}
       cursorY -= 14
     }
-  }
-  cursorY -= 8
-
-  // Subject
-  if (letter.subject) {
-    ensureSpace(18)
-    const subjLabel = 'Subject: '
-    page.drawText(subjLabel, { x: bounds.left, y: cursorY, size: 11, font: fontBold })
-    const labelW = fontBold.widthOfTextAtSize(subjLabel, 11)
-    const subj = letter.subject
-    // underline subject
-    const subjW = fontBold.widthOfTextAtSize(subj, 11)
-    page.drawText(subj, { x: bounds.left + labelW, y: cursorY, size: 11, font: fontBold })
-    page.drawLine({ start: { x: bounds.left + labelW, y: cursorY - 2 }, end: { x: bounds.left + labelW + subjW, y: cursorY - 2 }, thickness: 0.8, color: rgb(0, 0, 0) })
-    cursorY -= 20
-  }
-
-  // Salutation
-  if (letter.salutation) {
-    ensureSpace(16)
-    page.drawText(letter.salutation, { x: bounds.left, y: cursorY, size: 11, font: fontMed })
-    cursorY -= 20
-  }
-
-  // Body - parse HTML
-  const bodyBlocks = parseHtmlToBlocks(letter.body || '')
-  let currentAlign = 'left'
-  let lineBuffer = ''
-  let bufferStyle = { bold: false, italic: false }
-  const flushBuffer = () => {
-    if (!lineBuffer.trim()) { lineBuffer = ''; return }
-    const f = bufferStyle.bold ? fontBold : fontMed
-    const size = 11
-    const lh = 16
-    // simple wrapping
-    const words = lineBuffer.split(/\s+/)
-    let line = ''
-    for (const w of words) {
-      const test = line ? line + ' ' + w : w
-      if (f.widthOfTextAtSize(test, size) > bounds.width && line) {
-        ensureSpace(lh)
-        // draw line
-        let drawX = bounds.left
-        if (currentAlign === 'center') drawX = bounds.left + (bounds.width - f.widthOfTextAtSize(line, size)) / 2
-        if (currentAlign === 'right') drawX = bounds.right - f.widthOfTextAtSize(line, size)
-        page.drawText(line, { x: drawX, y: cursorY, size, font: f })
-        cursorY -= lh
-        line = w
-      } else {
-        line = test
+    if (letter.recipient_title) {
+      try { ensureSpace(14); page.drawText((letter.recipient_title||'').slice(0,100), { x: bounds.left, y: cursorY, size: 10, font: fontMed }) } catch{}
+      cursorY -= 14
+    }
+    if (letter.recipient_address) {
+      const lines = (letter.recipient_address||'').split('\n')
+      for (const ln of lines) {
+        if (!ln.trim()) continue
+        try { ensureSpace(14); page.drawText(ln.slice(0,120), { x: bounds.left, y: cursorY, size: 10, font: fontMed }) } catch{}
+        cursorY -= 14
       }
     }
-    if (line) {
-      ensureSpace(lh)
-      let drawX = bounds.left
-      if (currentAlign === 'center') drawX = bounds.left + (bounds.width - f.widthOfTextAtSize(line, size)) / 2
-      if (currentAlign === 'right') drawX = bounds.right - f.widthOfTextAtSize(line, size)
-      page.drawText(line, { x: drawX, y: cursorY, size, font: f })
-      cursorY -= lh
-    }
-    lineBuffer = ''
-  }
+    cursorY -= 8
 
-  for (const blk of bodyBlocks) {
-    if (blk.type === 'br') {
-      flushBuffer()
-      cursorY -= 4
-      if (cursorY < bounds.bottom + 20) {
-        page = addPage()
-        bounds = drawContentOnPage(currentPageIndex - 1, page)
-        cursorY = bounds.top - 16
-      }
-      continue
+    // Subject
+    if (letter.subject) {
+      try {
+        ensureSpace(18)
+        const subjLabel = 'Subject: '
+        page.drawText(subjLabel, { x: bounds.left, y: cursorY, size: 11, font: fontBold })
+        const labelW = fontBold.widthOfTextAtSize(subjLabel, 11)
+        const subj = (letter.subject||'').slice(0,120)
+        const subjW = fontBold.widthOfTextAtSize(subj, 11)
+        page.drawText(subj, { x: bounds.left + labelW, y: cursorY, size: 11, font: fontBold })
+        try { page.drawLine({ start: { x: bounds.left + labelW, y: cursorY - 2 }, end: { x: bounds.left + labelW + Math.min(subjW, bounds.width - labelW), y: cursorY - 2 }, thickness: 0.8, color: rgb(0, 0, 0) }) } catch{}
+      } catch(e){ console.warn('subject draw failed', e) }
+      cursorY -= 20
     }
-    if (blk.type === 'table') {
-      flushBuffer()
-      // Draw professional table
-      const table = blk
-      const colCount = Math.max(...table.rows.map(r => r.cells.reduce((sum, c) => sum + c.colspan, 0)))
-      const colWidth = bounds.width / colCount
-      const rowHeight = 20
-      const tableHeight = table.rows.length * rowHeight + 4
 
-      // Ensure space for table, keep together if possible
-      if (cursorY - tableHeight < bounds.bottom) {
-        // If table too big for page, still try to keep header + at least 1 row together
-        if (tableHeight > (bounds.top - bounds.bottom) * 0.7) {
-          // Table is large, allow split - just ensure header fits
-          if (cursorY - rowHeight * 2 < bounds.bottom) {
-            page = addPage()
-            bounds = drawContentOnPage(currentPageIndex - 1, page)
-            cursorY = bounds.top - 16
+    // Salutation
+    if (letter.salutation) {
+      try { ensureSpace(16); page.drawText((letter.salutation||'').slice(0,120), { x: bounds.left, y: cursorY, size: 11, font: fontMed }) } catch{}
+      cursorY -= 20
+    }
+
+    // Body
+    let bodyBlocks = []
+    try { bodyBlocks = parseHtmlToBlocks(letter.body || '') } catch(e){ bodyBlocks = [{ type: 'text', text: 'Body parse error' }] }
+    let currentAlign = 'left'
+    let lineBuffer = ''
+    let bufferStyle = { bold: false }
+    const flushBuffer = () => {
+      if (!lineBuffer.trim()) { lineBuffer = ''; return }
+      const f = bufferStyle.bold ? fontBold : fontMed
+      const size = 11
+      const lh = 16
+      const words = lineBuffer.split(/\s+/)
+      let line = ''
+      for (const w of words) {
+        const test = line ? line + ' ' + w : w
+        try {
+          if (f.widthOfTextAtSize(test, size) > bounds.width && line) {
+            ensureSpace(lh)
+            let drawX = bounds.left
+            if (currentAlign === 'center') drawX = bounds.left + (bounds.width - f.widthOfTextAtSize(line, size)) / 2
+            if (currentAlign === 'right') drawX = bounds.right - f.widthOfTextAtSize(line, size)
+            page.drawText(line, { x: drawX, y: cursorY, size, font: f })
+            cursorY -= lh
+            line = w
+          } else {
+            line = test
           }
-        } else {
-          page = addPage()
-          bounds = drawContentOnPage(currentPageIndex - 1, page)
-          cursorY = bounds.top - 16
+        } catch {
+          line = test
         }
       }
+      if (line) {
+        try {
+          ensureSpace(lh)
+          let drawX = bounds.left
+          if (currentAlign === 'center') drawX = bounds.left + (bounds.width - f.widthOfTextAtSize(line, size)) / 2
+          if (currentAlign === 'right') drawX = bounds.right - f.widthOfTextAtSize(line, size)
+          page.drawText(line, { x: drawX, y: cursorY, size, font: f })
+          cursorY -= lh
+        } catch(e){ console.warn('flush line failed', e) }
+      }
+      lineBuffer = ''
+    }
 
-      let y = cursorY
-      for (let rIdx = 0; rIdx < table.rows.length; rIdx++) {
-        const row = table.rows[rIdx]
-        const isHeader = row.isHeader || rIdx === 0
-
-        // Check if need new page for this row
-        if (y - rowHeight < bounds.bottom) {
+    for (const blk of bodyBlocks) {
+      if (blk.type === 'br') {
+        flushBuffer()
+        cursorY -= 4
+        if (cursorY < bounds.bottom + 20) {
           page = addPage()
-          bounds = drawContentOnPage(currentPageIndex - 1, page)
-          y = bounds.top - 10
-          // Redraw header if splitting
-          if (!isHeader && table.rows[0].isHeader) {
-            // Draw header again on new page
-            const header = table.rows[0]
+          bounds = drawContentOnPage(currentPageIndex - 1)
+          cursorY = bounds.top - 16
+        }
+        continue
+      }
+      if (blk.type === 'table') {
+        flushBuffer()
+        try {
+          const table = blk
+          if (!table.rows || table.rows.length === 0) continue
+          const colCount = Math.max(1, ...table.rows.map(r => (r.cells||[]).reduce((sum, c) => sum + (c.colspan||1), 0)))
+          const colWidth = bounds.width / colCount
+          const rowHeight = 20
+          const tableHeight = table.rows.length * rowHeight + 4
+
+          if (cursorY - tableHeight < bounds.bottom) {
+            if (tableHeight > (bounds.top - bounds.bottom) * 0.7) {
+              if (cursorY - rowHeight * 2 < bounds.bottom) {
+                page = addPage()
+                bounds = drawContentOnPage(currentPageIndex - 1)
+                cursorY = bounds.top - 16
+              }
+            } else {
+              page = addPage()
+              bounds = drawContentOnPage(currentPageIndex - 1)
+              cursorY = bounds.top - 16
+            }
+          }
+
+          let y = cursorY
+          for (let rIdx = 0; rIdx < table.rows.length; rIdx++) {
+            const row = table.rows[rIdx]
+            if (!row.cells || row.cells.length === 0) continue
+            const isHeader = row.isHeader || rIdx === 0
+
+            if (y - rowHeight < bounds.bottom) {
+              page = addPage()
+              bounds = drawContentOnPage(currentPageIndex - 1)
+              y = bounds.top - 16
+              if (!isHeader && table.rows[0]?.isHeader) {
+                try {
+                  const header = table.rows[0]
+                  let x = bounds.left
+                  for (const cell of header.cells) {
+                    const w = colWidth * (cell.colspan||1)
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.07, 0.07, 0.07) })
+                    page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.79, 0.66, 0.15), borderWidth: 0.8 })
+                    const text = (cell.text||'').slice(0, 30)
+                    page.drawText(text, { x: x + 4, y: y - 4, size: 9, font: fontBold, color: rgb(1, 1, 1) })
+                    x += w
+                  }
+                  y -= rowHeight
+                } catch{}
+              }
+            }
+
             let x = bounds.left
-            for (const cell of header.cells) {
-              const w = colWidth * cell.colspan
-              page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.07, 0.07, 0.07) })
-              page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.79, 0.66, 0.15), borderWidth: 0.8 })
-              const font = fontBold
-              const text = cell.text.slice(0, 30)
-              page.drawText(text, { x: x + 4, y: y - 4, size: 9, font, color: rgb(1, 1, 1) })
-              x += w
+            for (const cell of row.cells) {
+              try {
+                const w = colWidth * (cell.colspan||1)
+                if (isHeader) {
+                  page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.07, 0.07, 0.07) })
+                } else if (rIdx % 2 === 0) {
+                  page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.98, 0.98, 0.96) })
+                } else {
+                  page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(1, 1, 1) })
+                }
+                page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: isHeader ? rgb(0.79, 0.66, 0.15) : rgb(0.9, 0.9, 0.9), borderWidth: isHeader ? 0.8 : 0.5 })
+
+                const font = isHeader ? fontBold : fontMed
+                const size = 9
+                const textColor = isHeader ? rgb(1, 1, 1) : rgb(0.1, 0.1, 0.1)
+                let txt = (cell.text||'').slice(0, 80)
+                try {
+                  let txtWidth = font.widthOfTextAtSize(txt, size)
+                  while (txtWidth > w - 8 && txt.length > 0) {
+                    txt = txt.slice(0, -1)
+                    txtWidth = font.widthOfTextAtSize(txt + '…', size)
+                  }
+                  if (txt.length < (cell.text||'').length) txt += '…'
+                } catch{}
+                const isNum = /^-?[\d,]+(\.\d+)?$/.test((cell.text||'').replace(/[$%₦,]/g,'').trim())
+                let tx = x + 4
+                if (isNum) {
+                  try { const tw = font.widthOfTextAtSize(txt, size); tx = x + w - tw - 6 } catch{}
+                }
+                page.drawText(txt, { x: tx, y: y - 4, size, font, color: textColor })
+                x += w
+              } catch(e){ console.warn('cell draw failed', e) }
             }
             y -= rowHeight
           }
-        }
-
-        let x = bounds.left
-        for (const cell of row.cells) {
-          const w = colWidth * cell.colspan
-          // Background
-          if (isHeader) {
-            page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.07, 0.07, 0.07) })
-          } else if (rIdx % 2 === 0) {
-            page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.98, 0.98, 0.96) })
-          } else {
-            page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(1, 1, 1) })
-          }
-          // Border
-          page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: isHeader ? rgb(0.79, 0.66, 0.15) : rgb(0.9, 0.9, 0.9), borderWidth: isHeader ? 0.8 : 0.5 })
-
-          // Text
-          const font = isHeader ? fontBold : fontMed
-          const size = isHeader ? 9 : 9
-          const textColor = isHeader ? rgb(1, 1, 1) : rgb(0.1, 0.1, 0.1)
-          let txt = cell.text
-          // Truncate if too long
-          let txtWidth = font.widthOfTextAtSize(txt, size)
-          while (txtWidth > w - 8 && txt.length > 0) {
-            txt = txt.slice(0, -1)
-            txtWidth = font.widthOfTextAtSize(txt + '…', size)
-          }
-          if (txt.length < cell.text.length) txt += '…'
-
-          const isNum = /^-?[\d,]+(\.\d+)?$/.test(cell.text.replace(/[$%₦,]/g,'').trim())
-          let tx = x + 4
-          if (isNum) {
-            const tw = font.widthOfTextAtSize(txt, size)
-            tx = x + w - tw - 6
-          }
-
-          page.drawText(txt, { x: tx, y: y - 4, size, font, color: textColor })
-          x += w
-        }
-        y -= rowHeight
+          cursorY = y - 8
+        } catch(e){ console.warn('table draw failed', e); cursorY -= 20 }
+        continue
       }
-      cursorY = y - 8
-      continue
+      if (blk.type === 'text') {
+        if (blk.align) currentAlign = blk.align
+        bufferStyle = { bold: !!blk.bold }
+        lineBuffer += (lineBuffer ? ' ' : '') + (blk.text||'')
+      }
     }
-    if (blk.type === 'text') {
-      if (blk.align) currentAlign = blk.align
-      bufferStyle = { bold: !!blk.bold, italic: !!blk.italic }
-      lineBuffer += (lineBuffer ? ' ' : '') + blk.text
+    flushBuffer()
+
+    // Sign-off
+    const signOffHeight = showSignature ? 110 : 70
+    if (cursorY - signOffHeight < bounds.bottom) {
+      page = addPage()
+      bounds = drawContentOnPage(currentPageIndex - 1)
+      cursorY = bounds.top - 16
     }
-  }
-  flushBuffer()
+    cursorY -= 10
+    try { page.drawText(letter.closing_line || 'Yours sincerely,', { x: bounds.left, y: cursorY, size: 11, font: fontMed }) } catch{}
+    cursorY -= 18
+    if (showSignature && signImg) {
+      try {
+        const sigW = 110, sigH = 48
+        ensureSpace(sigH + 10)
+        page.drawImage(signImg, { x: bounds.left, y: cursorY - sigH + 12, width: sigW, height: sigH })
+        cursorY -= sigH + 8
+      } catch(e){ console.warn('sign draw failed', e); cursorY -= 30 }
+    } else {
+      cursorY -= 30
+    }
+    try { page.drawText(OWNER.name, { x: bounds.left, y: cursorY, size: 12, font: fontExtra }) } catch{}
+    cursorY -= 14
+    try { page.drawText(OWNER.position, { x: bounds.left, y: cursorY, size: 10.5, font: fontBold }) } catch{}
 
-  // Sign-off block - keep together
-  const signOffHeight = showSignature ? 110 : 70
-  // Keep signoff together - if no space, move entire block to next page
-  if (cursorY - signOffHeight < bounds.bottom) {
-    page = addPage()
-    bounds = drawContentOnPage(currentPageIndex - 1, page)
-    cursorY = bounds.top - 16
+    const pdfBytes = await pdfDoc.save()
+    return pdfBytes
+  } catch (err) {
+    console.error('exportLetterPdf failed', err)
+    throw new Error('PDF export failed: ' + (err.message || err))
   }
-  cursorY -= 10
-  page.drawText(letter.closing_line || 'Yours sincerely,', { x: bounds.left, y: cursorY, size: 11, font: fontMed })
-  cursorY -= 18
-  if (showSignature && signImg) {
-    const sigW = 110, sigH = 48
-    ensureSpace(sigH + 10)
-    page.drawImage(signImg, { x: bounds.left, y: cursorY - sigH + 12, width: sigW, height: sigH })
-    cursorY -= sigH + 8
-  } else {
-    cursorY -= 30
-  }
-  page.drawText(OWNER.name, { x: bounds.left, y: cursorY, size: 12, font: fontExtra })
-  cursorY -= 14
-  page.drawText(OWNER.position, { x: bounds.left, y: cursorY, size: 10.5, font: fontBold })
-
-  const pdfBytes = await pdfDoc.save()
-  return pdfBytes
 }
+
 
 // ---------- Main App ----------
 export default function App() {
@@ -1831,35 +1831,117 @@ export default function App() {
 
   const handleExportPdf = async (letterOverride = null) => {
     const l = letterOverride || current
-    if (!l) return
+    if (!l) {
+      alert('No letter to export')
+      return
+    }
     setSaveState('Exporting...')
     try {
+      console.log('Starting PDF export for', l.reference_no)
       const bytes = await exportLetterPdf(l, margins, l.signature_applied)
+      console.log('PDF bytes generated', bytes.length)
+      if (!bytes || bytes.length === 0) throw new Error('Generated PDF is empty')
+
       const blob = new Blob([bytes], { type: 'application/pdf' })
       const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${l.reference_no.replace(/\//g, '-')}_${(l.recipient_name || 'letter').replace(/\s+/g, '_')}.pdf`
-      a.click()
-      URL.revokeObjectURL(url)
-      // Optionally upload to supabase storage
+
+      // Robust download that works in all browsers
+      const fileName = `${(l.reference_no||'Q25-Letter').replace(/\//g, '-')}_${(l.recipient_name || 'letter').replace(/[^a-zA-Z0-9]/g, '_').slice(0,30)}.pdf`
+      try {
+        const a = document.createElement('a')
+        a.href = url
+        a.download = fileName
+        a.style.display = 'none'
+        document.body.appendChild(a)
+        a.click()
+        // Delay removal to ensure download starts
+        setTimeout(() => {
+          try { document.body.removeChild(a) } catch {}
+          URL.revokeObjectURL(url)
+        }, 2000)
+      } catch (dlErr) {
+        console.warn('Download via anchor failed, trying window.open', dlErr)
+        window.open(url, '_blank')
+        setTimeout(() => URL.revokeObjectURL(url), 5000)
+      }
+
+      // Optionally upload to supabase storage - non-blocking
       if (isSupabaseConfigured() && user) {
         try {
-          const fileName = `${user.id}/${l.id}.pdf`
-          await supabase.storage.from('letter-pdfs').upload(fileName, blob, { upsert: true, contentType: 'application/pdf' })
-          const { data } = await supabase.storage.from('letter-pdfs').createSignedUrl(fileName, 60 * 60 * 24 * 7)
-          if (data?.signedUrl) {
-            const updated = { ...l, pdf_url: data.signedUrl }
-            setCurrent(updated)
+          const fileNameStorage = `${user.id}/${l.id}.pdf`
+          const { error } = await supabase.storage.from('letter-pdfs').upload(fileNameStorage, blob, { upsert: true, contentType: 'application/pdf' })
+          if (!error) {
+            const { data } = await supabase.storage.from('letter-pdfs').createSignedUrl(fileNameStorage, 60 * 60 * 24 * 7)
+            if (data?.signedUrl) {
+              const updated = { ...l, pdf_url: data.signedUrl }
+              setCurrent(updated)
+            }
           }
         } catch (e) { console.warn('storage upload failed', e) }
       }
-      setSaveState('Saved')
+      setSaveState('Saved ✓')
+      setTimeout(() => setSaveState('Saved'), 2000)
     } catch (e) {
-      console.error(e)
+      console.error('Export failed', e)
       setSaveState('Export failed')
+      alert('PDF Export failed: ' + (e.message || 'Unknown error') + '\n\nCheck console for details. Trying print fallback.')
+      // Fallback to print
+      try { window.print() } catch {}
     }
   }
+
+  const handleSharePdf = async () => {
+    if (!current) return
+    // Check if Web Share API with files is supported
+    const canShareFiles = navigator.canShare && (() => {
+      try {
+        const testFile = new File([new Blob(['test'])], 'test.pdf', { type: 'application/pdf' })
+        return navigator.canShare({ files: [testFile] })
+      } catch { return false }
+    })()
+
+    if (navigator.share && canShareFiles) {
+      setSaveState('Preparing share...')
+      try {
+        const bytes = await exportLetterPdf(current, margins, current.signature_applied)
+        const blob = new Blob([bytes], { type: 'application/pdf' })
+        const fileName = `${(current.reference_no||'Q25-Letter').replace(/\//g, '-')}.pdf`
+        const file = new File([blob], fileName, { type: 'application/pdf' })
+        await navigator.share({
+          title: current.subject || 'Q25 Luxury Construx Letter',
+          text: `Letter ${current.reference_no} - ${current.recipient_name || ''}`,
+          files: [file]
+        })
+        setSaveState('Shared ✓')
+      } catch (err) {
+        console.warn('Share failed', err)
+        if (err.name !== 'AbortError') {
+          alert('Share failed: ' + err.message + '\nDownloading PDF instead.')
+          await handleExportPdf()
+        } else {
+          setSaveState('Saved')
+        }
+      }
+    } else if (navigator.share) {
+      // Share without files (text only) as fallback
+      try {
+        await navigator.share({
+          title: current.subject || 'Q25 Letter',
+          text: `Letter ${current.reference_no} to ${current.recipient_name || ''}\nSubject: ${current.subject || ''}`
+        })
+        setSaveState('Shared ✓')
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          alert('Share not fully supported, downloading PDF')
+          await handleExportPdf()
+        }
+      }
+    } else {
+      alert('Web Share not supported on this device, downloading PDF')
+      await handleExportPdf()
+    }
+  }
+
 
   const filteredLetters = useMemo(() => {
     let list = letters.filter(l => !l.is_deleted)
@@ -2021,15 +2103,7 @@ export default function App() {
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 }}>
                   <button className="btn-gold" onClick={() => handleExportPdf()} style={{ flex: 1 }}>⬇ Export PDF</button>
                   <button className="btn-ghost" onClick={() => window.print()}>⎙ Print</button>
-                  <button className="btn-ghost" onClick={async () => {
-                    if (navigator.share) {
-                      try {
-                        const bytes = await exportLetterPdf(current, margins, current.signature_applied)
-                        const file = new File([bytes], `${current.reference_no}.pdf`, { type: 'application/pdf' })
-                        await navigator.share({ title: current.subject, text: `Letter ${current.reference_no}`, files: [file] })
-                      } catch { alert('Share failed, PDF downloaded instead'); handleExportPdf() }
-                    } else { alert('Web Share not supported, downloading PDF'); handleExportPdf() }
-                  }}>↗ Share</button>
+                  <button className="btn-ghost" onClick={() => handleSharePdf()}>↗ Share</button>
                 </div>
 
                 <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>

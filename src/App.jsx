@@ -90,11 +90,24 @@ function AuthView({ onAuth }) {
   )
 }
 
-// ---------- Rich Text ----------
+// ---------- Rich Text with Table Support ----------
 function RichToolbar({ editorRef }) {
   const exec = (cmd, val = null) => {
     editorRef.current?.focus()
     document.execCommand(cmd, false, val)
+  }
+  const insertTable = () => {
+    const html = `
+      <table class="letter-table">
+        <thead><tr><th>Item</th><th>Description</th><th>Amount</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>Sample item</td><td class="num">₦100,000</td></tr>
+          <tr><td>2</td><td>Another item</td><td class="num">₦250,000</td></tr>
+          <tr><td colspan="2" style="text-align:right; font-weight:700">Total</td><td class="num" style="font-weight:700">₦350,000</td></tr>
+        </tbody>
+      </table><p><br/></p>`
+    editorRef.current?.focus()
+    document.execCommand('insertHTML', false, html)
   }
   const [align, setAlign] = useState('left')
   return (
@@ -105,6 +118,7 @@ function RichToolbar({ editorRef }) {
       <div style={{ width: 1, background: 'var(--border)', margin: '0 4px' }} />
       <button type="button" className="rich-btn" onMouseDown={e => { e.preventDefault(); exec('insertUnorderedList') }} title="Bullet list">•</button>
       <button type="button" className="rich-btn" onMouseDown={e => { e.preventDefault(); exec('insertOrderedList') }} title="Numbered list">1.</button>
+      <button type="button" className="rich-btn" onMouseDown={e => { e.preventDefault(); insertTable() }} title="Insert professional table">⊞</button>
       <div style={{ width: 1, background: 'var(--border)', margin: '0 4px' }} />
       <button type="button" className={`rich-btn ${align==='left'?'active':''}`} onMouseDown={e => { e.preventDefault(); exec('justifyLeft'); setAlign('left') }} title="Align left">L</button>
       <button type="button" className={`rich-btn ${align==='center'?'active':''}`} onMouseDown={e => { e.preventDefault(); exec('justifyCenter'); setAlign('center') }} title="Center">C</button>
@@ -114,37 +128,151 @@ function RichToolbar({ editorRef }) {
   )
 }
 
-// ---------- Document Import (Text, PDF, Word, Scanned) ----------
+// ---------- Document Import (Text, PDF, Word, Scanned) with Table Detection ----------
 function ImportDocModal({ open, onClose, onExtracted }) {
   const [dragOver, setDragOver] = useState(false)
   const [status, setStatus] = useState('')
   const [progress, setProgress] = useState(0)
   const [extracted, setExtracted] = useState('')
+  const [extractedHtml, setExtractedHtml] = useState('')
+  const [hasTables, setHasTables] = useState(false)
   const fileRef = useRef(null)
 
-  const formatToHtml = (text) => {
-    // Clean and format extracted text into paragraphs for letterhead
-    const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean)
-    // Try to detect subject/recipient? For now, just paragraphs
-    // Keep line breaks as paragraphs, preserve some structure
-    const paras = []
-    let current = []
-    for (const line of lines) {
-      if (line.length < 80 && (line.endsWith(':') || line.toUpperCase() === line && line.length > 3)) {
-        // Likely heading - flush
-        if (current.length) { paras.push(current.join(' ')); current = [] }
-        paras.push(`<p><strong>${line}</strong></p>`)
+  const detectTablesInText = (text) => {
+    // Detect markdown tables, tab-separated, or multi-space aligned tables
+    const lines = text.split('\n')
+    let tableLines = []
+    let inTable = false
+    let tables = []
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      // Markdown table row: | col | col |
+      const isMarkdownTable = /^\s*\|.*\|.*\|/.test(line) || /^\s*\|?\s*[-:]+\s*\|/.test(line)
+      // Tab separated with at least 2 tabs
+      const isTabTable = (line.match(/\t/g) || []).length >= 2
+      // Multi-space aligned (at least 3 columns separated by 2+ spaces)
+      const isSpaceTable = line.split(/\s{2,}/).filter(c => c.trim()).length >= 3
+
+      if (isMarkdownTable || isTabTable || isSpaceTable) {
+        if (!inTable) inTable = true
+        tableLines.push(line)
       } else {
-        current.push(line)
-        if (line.endsWith('.') && current.join(' ').length > 120) {
-          paras.push(current.join(' '))
-          current = []
+        if (inTable && tableLines.length >= 2) {
+          tables.push([...tableLines])
+        }
+        tableLines = []
+        inTable = false
+      }
+    }
+    if (inTable && tableLines.length >= 2) tables.push(tableLines)
+    return tables.length > 0
+  }
+
+  const textToHtmlWithTables = (text) => {
+    const lines = text.split('\n')
+    let html = ''
+    let inTable = false
+    let tableBuffer = []
+    let tableHeaders = []
+
+    const flushTable = () => {
+      if (tableBuffer.length === 0) return ''
+      // Detect if first row is header
+      let out = '<table class="letter-table"><thead><tr>'
+      const headerCells = tableBuffer[0].split(/\t|\s{2,}|\|/).map(c => c.trim()).filter(Boolean)
+      headerCells.forEach(h => {
+        if (h && !/^-+$/.test(h)) out += `<th>${h}</th>`
+      })
+      out += '</tr></thead><tbody>'
+      for (let i = 1; i < tableBuffer.length; i++) {
+        const line = tableBuffer[i]
+        if (/^\s*\|?\s*[-:]+\s*\|/.test(line)) continue // skip markdown separator
+        const cells = line.split(/\t|\s{2,}|\|/).map(c => c.trim()).filter(Boolean)
+        if (cells.length === 0) continue
+        out += '<tr>'
+        cells.forEach(cell => {
+          const isNum = /^-?[\d,]+(\.\d+)?$/.test(cell.replace(/[$%]/g,'').trim())
+          out += `<td class="${isNum ? 'num' : ''}">${cell}</td>`
+        })
+        out += '</tr>'
+      }
+      out += '</tbody></table>'
+      tableBuffer = []
+      return out
+    }
+
+    let result = []
+    let currentPara = []
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      const trimmed = line.trim()
+      if (!trimmed) {
+        if (currentPara.length) {
+          result.push(`<p>${currentPara.join(' ')}</p>`)
+          currentPara = []
+        }
+        if (inTable) {
+          result.push(flushTable())
+          inTable = false
+        }
+        continue
+      }
+
+      const isTableRow = (line.match(/\t/g) || []).length >= 2 || line.split(/\s{2,}/).filter(c => c.trim()).length >= 3 || /^\s*\|.*\|/.test(line)
+
+      if (isTableRow) {
+        if (currentPara.length) {
+          result.push(`<p>${currentPara.join(' ')}</p>`)
+          currentPara = []
+        }
+        inTable = true
+        tableBuffer.push(line)
+      } else {
+        if (inTable) {
+          // Check if table ended
+          if (tableBuffer.length >= 2) {
+            result.push(flushTable())
+          } else {
+            currentPara.push(...tableBuffer)
+          }
+          inTable = false
+        }
+        // Heading detection
+        if (trimmed.length < 80 && (trimmed.endsWith(':') || (trimmed.toUpperCase() === trimmed && trimmed.length > 3 && trimmed.length < 60))) {
+          if (currentPara.length) {
+            result.push(`<p>${currentPara.join(' ')}</p>`)
+            currentPara = []
+          }
+          result.push(`<p><strong>${trimmed}</strong></p>`)
+        } else {
+          currentPara.push(trimmed)
+          if (trimmed.endsWith('.') && currentPara.join(' ').length > 150) {
+            result.push(`<p>${currentPara.join(' ')}</p>`)
+            currentPara = []
+          }
         }
       }
     }
-    if (current.length) paras.push(current.join(' '))
-    // Convert to HTML
-    return paras.map(p => p.startsWith('<p>') ? p : `<p>${p}</p>`).join('\n')
+    if (inTable && tableBuffer.length) result.push(flushTable())
+    if (currentPara.length) result.push(`<p>${currentPara.join(' ')}</p>`)
+
+    return result.join('\n')
+  }
+
+  const formatToHtml = (text, htmlWithTables = null) => {
+    // If we have HTML with tables from mammoth, use it directly (cleaned)
+    if (htmlWithTables && htmlWithTables.includes('<table')) {
+      // Clean mammoth HTML: add our class
+      let cleaned = htmlWithTables
+        .replace(/<table>/g, '<table class="letter-table">')
+        .replace(/<table[^>]*>/g, '<table class="letter-table">')
+      // Wrap loose text in <p> if needed
+      return cleaned
+    }
+    // Otherwise use smart text-to-HTML with table detection
+    return textToHtmlWithTables(text)
   }
 
   const extractText = async (file) => {
@@ -157,92 +285,144 @@ function ImportDocModal({ open, onClose, onExtracted }) {
       if (type === 'text/plain' || ext === 'txt') {
         const txt = await file.text()
         setProgress(100)
+        setExtractedHtml('')
+        setHasTables(detectTablesInText(txt))
         return txt
       }
       if (type === 'application/pdf' || ext === 'pdf') {
-        setStatus('Extracting PDF (pdf.js)...')
+        setStatus('Extracting PDF with table detection (pdf.js)...')
         const pdfjsLib = await import('pdfjs-dist')
-        // Robust worker setup - use bundled worker, disable if mismatch
         try {
           const workerSrc = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
           pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc.default
-        } catch (e) {
-          console.warn('Local worker import failed, trying CDN', e)
-          try {
-            const version = pdfjsLib.version || '4.10.38'
-            pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
-          } catch {}
+        } catch {
+          const version = pdfjsLib.version || '4.10.38'
+          pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${version}/build/pdf.worker.min.mjs`
         }
         const buf = await file.arrayBuffer()
         let pdf
         try {
           pdf = await pdfjsLib.getDocument({ data: buf }).promise
         } catch (err) {
-          // Fallback: version mismatch or worker failed - try without worker
-          if (err.message && err.message.includes('API version') && err.message.includes('Worker version')) {
-            setStatus('Worker version mismatch, retrying without worker...')
-            console.warn('PDF.js version mismatch, retrying with disableWorker', err)
-            try {
-              pdfjsLib.GlobalWorkerOptions.workerSrc = ''
-              pdf = await pdfjsLib.getDocument({ data: buf, disableWorker: true }).promise
-            } catch (e2) {
-              // Last resort: try legacy build
-              const pdfjsLegacy = await import('pdfjs-dist/legacy/build/pdf.mjs')
-              pdf = await pdfjsLegacy.getDocument({ data: buf }).promise
-            }
-          } else {
-            throw err
-          }
+          if (err.message && err.message.includes('API version')) {
+            setStatus('Worker mismatch, retrying...')
+            pdfjsLib.GlobalWorkerOptions.workerSrc = ''
+            pdf = await pdfjsLib.getDocument({ data: buf, disableWorker: true }).promise
+          } else throw err
         }
-        let full = ''
+
+        let fullText = ''
+        let hasTable = false
+
         for (let i = 1; i <= pdf.numPages; i++) {
-          setProgress(Math.round((i / pdf.numPages) * 80))
-          setStatus(`Reading PDF page ${i}/${pdf.numPages}...`)
+          setProgress(Math.round((i / pdf.numPages) * 70))
+          setStatus(`Reading PDF page ${i}/${pdf.numPages} — detecting tables...`)
           const page = await pdf.getPage(i)
           const content = await page.getTextContent()
-          const strings = content.items.map(item => item.str).join(' ')
-          full += strings + '\n\n'
+
+          // Advanced: group items by Y to detect table rows
+          const items = content.items.map(item => ({
+            str: item.str,
+            x: item.transform[4],
+            y: item.transform[5],
+            width: item.width
+          })).filter(it => it.str.trim())
+
+          // Sort by Y descending, then X
+          items.sort((a, b) => b.y - a.y || a.x - b.x)
+
+          // Detect tables: look for rows with similar Y and multiple X clusters
+          let rows = []
+          let currentRow = []
+          let lastY = null
+          const yThreshold = 5
+
+          for (const item of items) {
+            if (lastY === null || Math.abs(item.y - lastY) < yThreshold) {
+              currentRow.push(item)
+            } else {
+              if (currentRow.length) rows.push(currentRow)
+              currentRow = [item]
+            }
+            lastY = item.y
+          }
+          if (currentRow.length) rows.push(currentRow)
+
+          // Check for table-like rows (multiple items with gaps)
+          let pageText = ''
+          for (const row of rows) {
+            row.sort((a, b) => a.x - b.x)
+            // If row has 3+ items with significant gaps, treat as table row with tabs
+            if (row.length >= 3) {
+              const gaps = []
+              for (let j = 1; j < row.length; j++) {
+                gaps.push(row[j].x - (row[j-1].x + row[j-1].width))
+              }
+              const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length
+              if (avgGap > 20) {
+                hasTable = true
+                // Join with tabs to preserve table structure
+                pageText += row.map(r => r.str).join('\t') + '\n'
+              } else {
+                pageText += row.map(r => r.str).join(' ') + '\n'
+              }
+            } else {
+              pageText += row.map(r => r.str).join(' ') + '\n'
+            }
+          }
+          fullText += pageText + '\n'
         }
         setProgress(100)
-        return full
+        setHasTables(hasTable || detectTablesInText(fullText))
+        setExtractedHtml('')
+        return fullText
       }
       if (ext === 'docx' || type.includes('officedocument.wordprocessingml')) {
-        setStatus('Extracting Word doc (mammoth)...')
+        setStatus('Extracting Word doc with tables (mammoth)...')
         const mammoth = await import('mammoth')
         const buf = await file.arrayBuffer()
-        const result = await mammoth.extractRawText({ arrayBuffer: buf })
+        // Try HTML first to preserve tables
+        const htmlResult = await mammoth.convertToHtml({ arrayBuffer: buf })
+        const textResult = await mammoth.extractRawText({ arrayBuffer: buf })
+        const hasTable = htmlResult.value.includes('<table')
+        setHasTables(hasTable)
+        setExtractedHtml(hasTable ? htmlResult.value : '')
         setProgress(100)
-        return result.value
+        return textResult.value
       }
       if (ext === 'doc') {
-        setStatus('Legacy .doc - trying mammoth...')
+        setStatus('Legacy .doc - extracting...')
         try {
           const mammoth = await import('mammoth')
           const buf = await file.arrayBuffer()
+          const htmlResult = await mammoth.convertToHtml({ arrayBuffer: buf }).catch(() => ({ value: '' }))
           const result = await mammoth.extractRawText({ arrayBuffer: buf })
+          setHasTables(htmlResult.value.includes('<table'))
+          setExtractedHtml(htmlResult.value)
           return result.value
         } catch {
           return await file.text().catch(() => 'Could not extract .doc - please save as .docx')
         }
       }
       if (type.startsWith('image/') || ['png','jpg','jpeg','webp','bmp'].includes(ext)) {
-        setStatus('Running OCR on scanned document (tesseract.js)... This may take 10-20s')
+        setStatus('OCR on scanned doc — detecting tables... (10-20s)')
         setProgress(20)
         const { createWorker } = await import('tesseract.js')
         const worker = await createWorker('eng', 1, {
           logger: m => {
             if (m.status === 'recognizing text') {
-              setProgress(20 + Math.round(m.progress * 70))
-              setStatus(`OCR: ${Math.round(m.progress*100)}% - ${m.status}`)
+              setProgress(20 + Math.round(m.progress * 60))
+              setStatus(`OCR: ${Math.round(m.progress*100)}% — ${m.status}`)
             }
           }
         })
         const { data } = await worker.recognize(file)
         await worker.terminate()
         setProgress(100)
+        setHasTables(detectTablesInText(data.text))
+        setExtractedHtml('')
         return data.text
       }
-      // Fallback try text
       return await file.text()
     } catch (e) {
       console.error(e)
@@ -254,10 +434,14 @@ function ImportDocModal({ open, onClose, onExtracted }) {
   const handleFiles = async (files) => {
     if (!files || !files.length) return
     const file = files[0]
+    if (file.size > 20 * 1024 * 1024) {
+      setStatus('File too large — max 20MB')
+      return
+    }
     try {
       const text = await extractText(file)
       setExtracted(text)
-      setStatus(`Extracted ${text.length} characters from ${file.name}`)
+      setStatus(`Extracted ${text.length} chars${hasTables ? ' — tables detected!' : ''} from ${file.name}`)
     } catch (err) {
       setStatus('Failed: ' + err.message)
     }
@@ -272,10 +456,13 @@ function ImportDocModal({ open, onClose, onExtracted }) {
   if (!open) return null
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', padding: 20, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(8px)' }}>
-      <div className="glass-strong" style={{ width: '100%', maxWidth: 720, borderRadius: 24, padding: 24, maxHeight: '90vh', overflowY: 'auto' }}>
+    <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', padding: 20, background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(10px)' }}>
+      <div className="glass-strong" style={{ width: '100%', maxWidth: 780, borderRadius: 24, padding: 24, maxHeight: '92vh', overflowY: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <h3 style={{ fontSize: 18 }}>Import Document to Letterhead</h3>
+          <div>
+            <h3 style={{ fontSize: 19 }}>Import Document to Letterhead</h3>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>Auto-detects tables, text, and formats professionally</div>
+          </div>
           <button className="btn-ghost" onClick={onClose} style={{ padding: '6px 12px' }}>✕ Close</button>
         </div>
 
@@ -287,57 +474,82 @@ function ImportDocModal({ open, onClose, onExtracted }) {
           style={{
             border: `2px dashed ${dragOver ? 'var(--gold)' : 'var(--border-strong)'}`,
             borderRadius: 16,
-            padding: 32,
+            padding: 28,
             textAlign: 'center',
             background: dragOver ? 'rgba(201,162,39,0.08)' : 'var(--surface)',
             cursor: 'pointer',
             transition: 'all 0.2s'
           }}
         >
-          <div style={{ fontSize: 32, marginBottom: 8 }}>📄</div>
-          <div style={{ fontWeight: 700 }}>Drop text, PDF, Word, or scanned image here</div>
-          <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 6 }}>Supports .txt, .pdf, .docx, .doc, .png, .jpg, .jpeg — max 20MB</div>
-          <div style={{ marginTop: 12 }}>
-            <span className="btn-gold" style={{ padding: '8px 16px', fontSize: 13 }}>Browse Files</span>
+          <div style={{ fontSize: 36, marginBottom: 8 }}>📄📊</div>
+          <div style={{ fontWeight: 800, fontSize: 15 }}>Drop document with tables here</div>
+          <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 6, lineHeight: 1.4 }}>
+            <strong>Text, PDF, Word, Scanned Images</strong><br/>
+            Auto-detects tables • Preserves structure • Professional gold/black styling<br/>
+            .txt, .pdf, .docx, .doc, .png, .jpg — max 20MB
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <span className="btn-gold" style={{ padding: '10px 18px', fontSize: 13 }}>Browse Files</span>
           </div>
           <input ref={fileRef} type="file" accept=".txt,.pdf,.docx,.doc,.png,.jpg,.jpeg,.webp" style={{ display: 'none' }} onChange={e => handleFiles(e.target.files)} />
         </div>
 
         {status && (
           <div className="glass" style={{ marginTop: 16, padding: 12, borderRadius: 12, fontSize: 13 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-              <span>{status}</span>
-              <span>{progress}%</span>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, alignItems: 'center' }}>
+              <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                {status}
+                {hasTables && <span style={{ background: 'var(--gold)', color: '#000', padding: '2px 8px', borderRadius: 999, fontSize: 11, fontWeight: 700 }}>TABLES DETECTED</span>}
+              </span>
+              <span style={{ fontWeight: 700 }}>{progress}%</span>
             </div>
             <div style={{ height: 6, background: 'var(--border)', borderRadius: 999, overflow: 'hidden' }}>
-              <div style={{ width: `${progress}%`, height: '100%', background: 'var(--gold)', transition: 'width 0.3s' }} />
+              <div style={{ width: `${progress}%`, height: '100%', background: hasTables ? 'linear-gradient(90deg, var(--gold), #111)' : 'var(--gold)', transition: 'width 0.3s' }} />
             </div>
           </div>
         )}
 
         {extracted && (
-          <div style={{ marginTop: 16 }}>
-            <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)' }}>EXTRACTED TEXT ({extracted.length} chars)</label>
-            <div className="input-glass" style={{ marginTop: 6, maxHeight: 240, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.6 }}>{extracted.slice(0, 4000)}{extracted.length > 4000 ? '\n... (truncated preview)' : ''}</div>
-
-            <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-              <button className="btn-gold" onClick={() => {
-                const html = formatToHtml(extracted)
-                onExtracted(html, extracted)
-                onClose()
-              }}>✨ Format & Put on Letterhead</button>
-              <button className="btn-ghost" onClick={() => {
-                // Try to auto-detect subject/recipient? Simple heuristic
-                const lines = extracted.split('\n').filter(l => l.trim()).slice(0,5)
-                const subject = lines.find(l => l.toLowerCase().includes('subject:'))?.replace(/subject:/i,'').trim() || ''
-                onExtracted(formatToHtml(extracted), extracted, { subject })
-                onClose()
-              }}>Auto-detect Subject</button>
-              <button className="btn-ghost" onClick={() => { setExtracted(''); setStatus(''); setProgress(0) }}>Clear</button>
+          <div style={{ marginTop: 18 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <label style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: 'var(--text-secondary)' }}>
+                EXTRACTED {hasTables ? 'WITH TABLES' : 'TEXT'} ({extracted.length} chars)
+              </label>
+              <span style={{ fontSize: 11, color: hasTables ? 'var(--gold)' : 'var(--text-tertiary)', fontWeight: 700 }}>
+                {hasTables ? '📊 Tables will be formatted professionally' : '📝 Plain text'}
+              </span>
             </div>
 
-            <div style={{ marginTop: 12, fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.4 }}>
-              <strong>How formatting works:</strong> Extracted text is cleaned, split into paragraphs, and placed into the letter body on your real Q25 letterhead (Page 1 = Letter 1, rest = Letter 2). You can then edit, add recipient, subject, and export PDF with CEO signature.
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 8 }}>
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>RAW TEXT</div>
+                <div className="input-glass" style={{ maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 12, lineHeight: 1.5 }}>{extracted.slice(0, 3000)}{extracted.length > 3000 ? '\n... (truncated)' : ''}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-tertiary)', marginBottom: 4 }}>PREVIEW ON LETTERHEAD</div>
+                <div className="glass" style={{ maxHeight: 220, overflowY: 'auto', padding: 12, borderRadius: 12, fontSize: 11, lineHeight: 1.5 }} dangerouslySetInnerHTML={{ __html: formatToHtml(extracted, extractedHtml).slice(0, 5000) }} />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+              <button className="btn-gold" onClick={() => {
+                const html = formatToHtml(extracted, extractedHtml)
+                onExtracted(html, extracted)
+                onClose()
+              }}>✨ {hasTables ? 'Format Tables & Text on Letterhead' : 'Put on Letterhead'}</button>
+              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => {
+                const lines = extracted.split('\n').filter(l => l.trim()).slice(0,5)
+                const subject = lines.find(l => l.toLowerCase().includes('subject:'))?.replace(/subject:/i,'').trim() || ''
+                onExtracted(formatToHtml(extracted, extractedHtml), extracted, { subject })
+                onClose()
+              }}>Auto-detect Subject</button>
+              <button className="btn-ghost" style={{ fontSize: 12 }} onClick={() => { setExtracted(''); setExtractedHtml(''); setStatus(''); setProgress(0); setHasTables(false) }}>Clear</button>
+            </div>
+
+            <div className="glass" style={{ marginTop: 14, padding: 12, borderRadius: 12, fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+              <strong>🧠 Smart formatting:</strong> 
+              {hasTables ? ' Tables detected — will be rendered with professional black header + gold border, alternating rows, right-aligned numbers, and kept together on one page.' : ' Plain text — split into paragraphs with headings preserved.'}
+              <br/>All content flows across pages: Page 1 uses Letter 1 background, rest use Letter 2. Tables are never split awkwardly.
             </div>
           </div>
         )}
@@ -495,6 +707,34 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
       if (['i', 'em'].includes(tag)) newStyles.italic = true
       if (tag === 'u') newStyles.underline = true
       if (tag === 'br') { blocks.push({ type: 'br' }); return }
+      if (tag === 'table') {
+        // Parse table professionally
+        const rows = []
+        const thead = node.querySelector('thead')
+        const tbody = node.querySelector('tbody') || node
+        const headerRows = thead ? Array.from(thead.querySelectorAll('tr')) : []
+        const bodyRows = Array.from(tbody.querySelectorAll('tr'))
+
+        const parseRow = (tr) => {
+          return Array.from(tr.querySelectorAll('th, td')).map(cell => ({
+            text: cell.textContent.trim(),
+            isHeader: cell.tagName.toLowerCase() === 'th',
+            colspan: parseInt(cell.getAttribute('colspan') || '1', 10)
+          }))
+        }
+
+        if (headerRows.length) {
+          headerRows.forEach(tr => rows.push({ cells: parseRow(tr), isHeader: true }))
+        }
+        bodyRows.forEach(tr => {
+          // Skip if already counted as header and thead exists
+          if (thead && thead.contains(tr)) return
+          rows.push({ cells: parseRow(tr), isHeader: false })
+        })
+
+        if (rows.length) blocks.push({ type: 'table', rows })
+        return
+      }
       if (tag === 'p' || tag === 'div') {
         if (blocks.length && blocks[blocks.length - 1].type !== 'br') blocks.push({ type: 'br' })
         const align = node.style.textAlign || ''
@@ -695,6 +935,102 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
         bounds = drawContentOnPage(currentPageIndex - 1, page)
         cursorY = bounds.top - 10
       }
+      continue
+    }
+    if (blk.type === 'table') {
+      flushBuffer()
+      // Draw professional table
+      const table = blk
+      const colCount = Math.max(...table.rows.map(r => r.cells.reduce((sum, c) => sum + c.colspan, 0)))
+      const colWidth = bounds.width / colCount
+      const rowHeight = 20
+      const tableHeight = table.rows.length * rowHeight + 4
+
+      // Ensure space for table, keep together if possible
+      if (cursorY - tableHeight < bounds.bottom) {
+        // If table too big for page, still try to keep header + at least 1 row together
+        if (tableHeight > (bounds.top - bounds.bottom) * 0.7) {
+          // Table is large, allow split - just ensure header fits
+          if (cursorY - rowHeight * 2 < bounds.bottom) {
+            page = addPage()
+            bounds = drawContentOnPage(currentPageIndex - 1, page)
+            cursorY = bounds.top - 10
+          }
+        } else {
+          page = addPage()
+          bounds = drawContentOnPage(currentPageIndex - 1, page)
+          cursorY = bounds.top - 10
+        }
+      }
+
+      let y = cursorY
+      for (let rIdx = 0; rIdx < table.rows.length; rIdx++) {
+        const row = table.rows[rIdx]
+        const isHeader = row.isHeader || rIdx === 0
+
+        // Check if need new page for this row
+        if (y - rowHeight < bounds.bottom) {
+          page = addPage()
+          bounds = drawContentOnPage(currentPageIndex - 1, page)
+          y = bounds.top - 10
+          // Redraw header if splitting
+          if (!isHeader && table.rows[0].isHeader) {
+            // Draw header again on new page
+            const header = table.rows[0]
+            let x = bounds.left
+            for (const cell of header.cells) {
+              const w = colWidth * cell.colspan
+              page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.07, 0.07, 0.07) })
+              page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: rgb(0.79, 0.66, 0.15), borderWidth: 0.8 })
+              const font = fontBold
+              const text = cell.text.slice(0, 30)
+              page.drawText(text, { x: x + 4, y: y - 4, size: 9, font, color: rgb(1, 1, 1) })
+              x += w
+            }
+            y -= rowHeight
+          }
+        }
+
+        let x = bounds.left
+        for (const cell of row.cells) {
+          const w = colWidth * cell.colspan
+          // Background
+          if (isHeader) {
+            page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.07, 0.07, 0.07) })
+          } else if (rIdx % 2 === 0) {
+            page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(0.98, 0.98, 0.96) })
+          } else {
+            page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, color: rgb(1, 1, 1) })
+          }
+          // Border
+          page.drawRectangle({ x, y: y - rowHeight + 4, width: w, height: rowHeight, borderColor: isHeader ? rgb(0.79, 0.66, 0.15) : rgb(0.9, 0.9, 0.9), borderWidth: isHeader ? 0.8 : 0.5 })
+
+          // Text
+          const font = isHeader ? fontBold : fontMed
+          const size = isHeader ? 9 : 9
+          const textColor = isHeader ? rgb(1, 1, 1) : rgb(0.1, 0.1, 0.1)
+          let txt = cell.text
+          // Truncate if too long
+          let txtWidth = font.widthOfTextAtSize(txt, size)
+          while (txtWidth > w - 8 && txt.length > 0) {
+            txt = txt.slice(0, -1)
+            txtWidth = font.widthOfTextAtSize(txt + '…', size)
+          }
+          if (txt.length < cell.text.length) txt += '…'
+
+          const isNum = /^-?[\d,]+(\.\d+)?$/.test(cell.text.replace(/[$%₦,]/g,'').trim())
+          let tx = x + 4
+          if (isNum) {
+            const tw = font.widthOfTextAtSize(txt, size)
+            tx = x + w - tw - 6
+          }
+
+          page.drawText(txt, { x: tx, y: y - 4, size, font, color: textColor })
+          x += w
+        }
+        y -= rowHeight
+      }
+      cursorY = y - 8
       continue
     }
     if (blk.type === 'text') {

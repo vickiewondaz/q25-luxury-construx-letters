@@ -1424,7 +1424,7 @@ function buildLetterBlocks(letter, showSignature) {
   }
 }
 
-// ---------- Preview - ROBUST with blank page removal & heading spacing ----------
+// ---------- Preview - with table row splitting to avoid blank pages ----------
 function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true }) {
   const containerRef = useRef(null)
   const contentMeasureRef = useRef(null)
@@ -1433,23 +1433,41 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
 
   const blocks = useMemo(() => buildLetterBlocks(letter, showSignature), [letter, showSignature])
 
+  // Helper to parse table HTML into header and rows
+  const parseTableForSplit = (tableHtml) => {
+    try {
+      const doc = new DOMParser().parseFromString(tableHtml, 'text/html')
+      const table = doc.querySelector('table')
+      if (!table) return null
+      const thead = table.querySelector('thead')
+      const headerHtml = thead ? thead.outerHTML : (table.querySelector('tr') ? `<thead>${table.querySelector('tr').outerHTML}</thead>` : '')
+      const headerRowCount = thead ? thead.querySelectorAll('tr').length : 1
+      const allRows = Array.from(table.querySelectorAll('tbody tr, tr'))
+      const bodyRows = allRows.filter(tr => {
+        if (thead && thead.contains(tr)) return false
+        // Skip if it's the first row and we used it as header and no thead
+        if (!thead && allRows.indexOf(tr) === 0) return false
+        return true
+      })
+      return {
+        headerHtml,
+        bodyRows: bodyRows.map(r => r.outerHTML),
+        headerRowCount,
+        tableClass: table.className || 'letter-table',
+        fullTable: table
+      }
+    } catch (e) {
+      console.warn('parseTableForSplit failed', e)
+      return null
+    }
+  }
+
   useEffect(() => {
     try {
       if (!contentMeasureRef.current) return
       const measurer = contentMeasureRef.current
       const contentWidth = 794 - margins.p1.left - margins.p1.right
       measurer.style.width = contentWidth + 'px'
-
-      const measurements = []
-      for (const block of blocks) {
-        try {
-          measurer.innerHTML = block.html
-          const h = measurer.scrollHeight || block.heightEstimate || 40
-          measurements.push({ ...block, measuredHeight: Math.min(h + 6, 800) })
-        } catch {
-          measurements.push({ ...block, measuredHeight: block.heightEstimate || 60 })
-        }
-      }
 
       const p1Usable = 1123 - margins.p1.top - margins.p1.bottom
       const p2Usable = 1123 - margins.p2.top - margins.p2.bottom
@@ -1459,56 +1477,161 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
       let currentHeight = 0
       let currentUsable = p1Usable
 
-      for (let i = 0; i < measurements.length; i++) {
-        const blk = measurements[i]
-        const blkH = blk.measuredHeight
-
-        // Skip empty blocks that would create blank pages
-        const isEmpty = !blk.html || blk.html.replace(/<[^>]+>/g,'').trim().length === 0
-        if (isEmpty && blk.type !== 'table') continue
-
-        if (blkH > currentUsable) {
-          if (currentPageBlocks.length > 0) {
-            // Only push non-empty pages
-            if (currentPageBlocks.some(b => b.html && b.html.replace(/<[^>]+>/g,'').trim().length > 0)) {
-              pages.push(currentPageBlocks)
-            }
-            currentPageBlocks = []
-            currentHeight = 0
-            currentUsable = p2Usable
-          }
-          if (blk.isTable && blkH > currentUsable * 1.2) {
-            pages.push([blk])
-            currentPageBlocks = []
-            currentHeight = 0
-            currentUsable = p2Usable
-            continue
-          } else {
-            if (blkH > currentUsable) {
-              currentPageBlocks.push(blk)
-              pages.push(currentPageBlocks)
-              currentPageBlocks = []
-              currentHeight = 0
-              currentUsable = p2Usable
-              continue
-            }
-          }
+      const measureHtml = (html) => {
+        try {
+          measurer.innerHTML = html
+          return measurer.scrollHeight || 40
+        } catch {
+          return 60
         }
+      }
+
+      for (let i = 0; i < blocks.length; i++) {
+        const blk = blocks[i]
+        const isEmpty = !blk.html || blk.html.replace(/<[^>]+>/g,'').trim().length === 0
+        if (isEmpty && !blk.isTable) continue
+
+        // Handle tables with row splitting
+        if (blk.isTable) {
+          const parsed = parseTableForSplit(blk.html)
+          if (!parsed || parsed.bodyRows.length === 0) {
+            // Fallback to old logic
+            const blkH = Math.min(measureHtml(blk.html) + 6, 800)
+            if (currentHeight + blkH > currentUsable) {
+              if (currentPageBlocks.length > 0) pages.push(currentPageBlocks)
+              currentPageBlocks = [{ ...blk, measuredHeight: blkH }]
+              currentHeight = blkH
+              currentUsable = p2Usable
+            } else {
+              currentPageBlocks.push({ ...blk, measuredHeight: blkH })
+              currentHeight += blkH
+            }
+            continue
+          }
+
+          // Measure header
+          const headerTableHtml = `<table class="${parsed.tableClass}" style="width:100%; border-collapse:collapse"><${parsed.headerHtml.includes('<thead') ? '' : 'thead>'}${parsed.headerHtml}${parsed.headerHtml.includes('</thead>') ? '' : '</thead>'}</table>`
+          const headerHeight = measureHtml(`<div class="letter-block" style="margin:22px 0">${headerTableHtml}</div>`)
+          
+          // Measure each row
+          const rowHeights = []
+          const rowHtmls = []
+          for (const rowHtml of parsed.bodyRows) {
+            const singleRowTable = `<table class="${parsed.tableClass}" style="width:100%; border-collapse:collapse"><tbody>${rowHtml}</tbody></table>`
+            const h = measureHtml(`<div style="margin:0">${singleRowTable}</div>`)
+            rowHeights.push(Math.max(h, 32))
+            rowHtmls.push(rowHtml)
+          }
+
+          // Now paginate rows
+          let remaining = currentUsable - currentHeight
+          const firstRowHeight = rowHeights[0] || 40
+          
+          // If header + first row doesn't fit in remaining and we have content, move to next page
+          if (headerHeight + firstRowHeight > remaining && currentPageBlocks.length > 0) {
+            pages.push(currentPageBlocks)
+            currentPageBlocks = []
+            currentHeight = 0
+            currentUsable = p2Usable
+            remaining = currentUsable
+          }
+
+          // Build table chunks
+          let currentTableRows = []
+          let currentTableHeight = headerHeight
+          let chunkIndex = 0
+
+          for (let r = 0; r < rowHtmls.length; r++) {
+            const rH = rowHeights[r]
+            
+            if (currentTableHeight + rH > remaining) {
+              // Need new page for this chunk
+              if (currentTableRows.length > 0) {
+                // Create table HTML for current chunk
+                const chunkHtml = `<div class="letter-block lb-table" style="break-inside:avoid; margin:22px 0"><table class="${parsed.tableClass}" style="width:100%; border-collapse:collapse; font-size:10.5pt; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); border:1px solid #e5e5e5">${parsed.headerHtml}<tbody>${currentTableRows.join('')}</tbody></table></div>`
+                currentPageBlocks.push({
+                  id: `${blk.id}-chunk-${chunkIndex}`,
+                  type: 'table',
+                  html: chunkHtml,
+                  text: 'TABLE CHUNK',
+                  keepTogether: false,
+                  isTable: true,
+                  measuredHeight: currentTableHeight
+                })
+                pages.push(currentPageBlocks)
+                currentPageBlocks = []
+                currentHeight = 0
+                currentUsable = p2Usable
+                remaining = currentUsable
+                chunkIndex++
+                currentTableRows = []
+                currentTableHeight = headerHeight
+              } else {
+                // First row doesn't fit even on new page (very tall row) - force it
+                // This can happen with very long description
+                // Put it alone on page
+                const chunkHtml = `<div class="letter-block lb-table" style="margin:22px 0"><table class="${parsed.tableClass}" style="width:100%; border-collapse:collapse">${parsed.headerHtml}<tbody>${rowHtmls[r]}</tbody></table></div>`
+                currentPageBlocks.push({
+                  id: `${blk.id}-chunk-${chunkIndex}`,
+                  type: 'table',
+                  html: chunkHtml,
+                  text: 'TABLE CHUNK',
+                  isTable: true,
+                  measuredHeight: headerHeight + rH
+                })
+                pages.push(currentPageBlocks)
+                currentPageBlocks = []
+                currentHeight = 0
+                currentUsable = p2Usable
+                remaining = currentUsable
+                chunkIndex++
+                continue
+              }
+            }
+            
+            currentTableRows.push(rowHtmls[r])
+            currentTableHeight += rH
+          }
+
+          // Add remaining rows as final chunk on current page
+          if (currentTableRows.length > 0) {
+            const chunkHtml = `<div class="letter-block lb-table" style="break-inside:avoid; margin:22px 0"><table class="${parsed.tableClass}" style="width:100%; border-collapse:collapse; font-size:10.5pt; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); border:1px solid #e5e5e5">${parsed.headerHtml}<tbody>${currentTableRows.join('')}</tbody></table></div>`
+            currentPageBlocks.push({
+              id: `${blk.id}-chunk-${chunkIndex}`,
+              type: 'table',
+              html: chunkHtml,
+              text: 'TABLE CHUNK',
+              isTable: true,
+              measuredHeight: currentTableHeight
+            })
+            currentHeight += currentTableHeight
+          }
+
+          continue
+        }
+
+        // Non-table blocks - old logic but with blank page avoidance
+        const blkH = (() => {
+          try {
+            measurer.innerHTML = blk.html
+            return Math.min(measurer.scrollHeight + 6, 600)
+          } catch { return blk.heightEstimate || 60 }
+        })()
 
         if (currentHeight + blkH > currentUsable) {
           if (currentPageBlocks.length > 0) {
             pages.push(currentPageBlocks)
+            currentPageBlocks = []
+            currentHeight = 0
+            currentUsable = p2Usable
           }
-          currentPageBlocks = [blk]
-          currentHeight = blkH
-          currentUsable = p2Usable
-        } else {
-          currentPageBlocks.push(blk)
-          currentHeight += blkH
         }
+        
+        currentPageBlocks.push({ ...blk, measuredHeight: blkH })
+        currentHeight += blkH
       }
+
       if (currentPageBlocks.length > 0) {
-        // Remove blank trailing page
         const hasContent = currentPageBlocks.some(b => {
           const txt = (b.text||'').trim() || b.html.replace(/<[^>]+>/g,'').trim()
           return txt.length > 0
@@ -1516,17 +1639,14 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
         if (hasContent) pages.push(currentPageBlocks)
       }
 
-      // Remove unwanted blank pages - filter out pages with no meaningful content
       const filteredPages = pages.filter(pageBlocks => {
         if (!pageBlocks || pageBlocks.length === 0) return false
         const totalText = pageBlocks.map(b => (b.text||'') + b.html.replace(/<[^>]+>/g,'')).join('').trim()
         const hasTable = pageBlocks.some(b => b.isTable)
-        // Keep page if has table or has at least 10 chars of text
         return hasTable || totalText.length > 10
       })
 
-      // Ensure at least 1 page
-      const finalPages = filteredPages.length > 0 ? filteredPages : (pages.length > 0 ? pages : [measurements])
+      const finalPages = filteredPages.length > 0 ? filteredPages : (pages.length > 0 ? pages : [[]])
 
       setPagesData(finalPages)
       setError(null)
@@ -1578,6 +1698,7 @@ function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true
     </div>
   )
 }
+
 
 // ---------- PDF Export - EXACT MATCH to Preview, No Font/Position Change ----------
 async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature = true) {

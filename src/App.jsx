@@ -6,8 +6,8 @@ const COMPANY = 'Q25 LUXURY CONSTRUX'
 const GOLD = '#C9A227'
 
 const DEFAULT_MARGINS = {
-  p1: { top: 155, bottom: 110, left: 62, right: 58 },
-  p2: { top: 68, bottom: 78, left: 62, right: 58 }
+  p1: { top: 210, bottom: 115, left: 62, right: 58 },
+  p2: { top: 82, bottom: 85, left: 62, right: 58 }
 }
 
 const uid = () => Math.random().toString(36).slice(2, 10)
@@ -779,97 +779,249 @@ function ImportDocModal({ open, onClose, onExtracted }) {
 // ---------- Preview ----------
 function LetterPreview({ letter, margins = DEFAULT_MARGINS, showSignature = true }) {
   const containerRef = useRef(null)
-  const [pages, setPages] = useState(1)
   const contentMeasureRef = useRef(null)
+  const [pagesData, setPagesData] = useState([[]])
+  const [totalPages, setTotalPages] = useState(1)
 
-  // Build HTML for full letter content (header fields + body + signoff)
-  const fullHtml = useMemo(() => {
+  const blocks = useMemo(() => {
     const dateStr = letter.letter_date ? new Date(letter.letter_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : ''
     const ref = letter.reference_no || ''
-    const recip = `
-      <div style="margin-bottom:18px">
-        ${letter.recipient_name ? `<div style="font-weight:700">${letter.recipient_name}</div>` : ''}
-        ${letter.recipient_title ? `<div>${letter.recipient_title}</div>` : ''}
-        ${letter.recipient_address ? `<div style="white-space:pre-line">${letter.recipient_address}</div>` : ''}
-      </div>`
-    const subject = letter.subject ? `<div style="margin:14px 0 10px 0"><span style="font-weight:700">Subject: </span><span style="font-weight:700; text-decoration:underline">${letter.subject}</span></div>` : ''
-    const salutation = letter.salutation ? `<div style="margin:10px 0 12px 0">${letter.salutation}</div>` : ''
-    const body = letter.body || '<p style="color:#999">Start typing your letter...</p>'
-    const signOff = `
-      <div id="signoff-block" style="margin-top:32px; page-break-inside:avoid; break-inside:avoid">
-        <div>${letter.closing_line || 'Yours sincerely,'}</div>
-        ${showSignature ? `<img src="/sign.png" alt="signature" style="height:68px; margin:10px 0 6px 0; object-fit:contain; display:block; filter: contrast(1.2)" />` : '<div style="height:42px"></div>'}
-        <div style="font-weight:800; font-size:12pt; letter-spacing:0.2px">${OWNER.name}</div>
+
+    const blockList = []
+
+    // Ref & Date - with professional spacing
+    blockList.push({
+      id: 'refdate',
+      type: 'refdate',
+      html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-top:18px; margin-bottom:22px; padding-top:8px; display:flex; justify-content:space-between; font-size:10.5pt; align-items:flex-start; line-height:1.4">
+          <div style="font-weight:700; letter-spacing:0.2px">Ref: ${ref}</div>
+          <div style="text-align:right; font-weight:500; color:#222">${dateStr}</div>
+        </div>`,
+      keepTogether: true
+    })
+
+    // Recipient
+    if (letter.recipient_name || letter.recipient_title || letter.recipient_address) {
+      let html = `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-bottom:20px; line-height:1.5">`
+      if (letter.recipient_name) html += `<div style="font-weight:700; font-size:11.5pt">${letter.recipient_name}</div>`
+      if (letter.recipient_title) html += `<div style="font-size:10.5pt; color:#222">${letter.recipient_title}</div>`
+      if (letter.recipient_address) html += `<div style="white-space:pre-line; font-size:10.5pt; margin-top:2px">${letter.recipient_address}</div>`
+      html += `</div>`
+      blockList.push({ id: 'recipient', type: 'recipient', html, keepTogether: true })
+    }
+
+    // Subject
+    if (letter.subject) {
+      blockList.push({
+        id: 'subject',
+        type: 'subject',
+        html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:16px 0 14px 0; font-size:11pt"><span style="font-weight:700">Subject: </span><span style="font-weight:700; text-decoration:underline; text-underline-offset:3px">${letter.subject}</span></div>`,
+        keepTogether: true
+      })
+    }
+
+    // Salutation
+    if (letter.salutation) {
+      blockList.push({
+        id: 'salutation',
+        type: 'salutation',
+        html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:12px 0 16px 0; font-size:11.5pt">${letter.salutation}</div>`,
+        keepTogether: true
+      })
+    }
+
+    // Body - split into blocks to avoid cutting
+    const bodyHtml = letter.body || '<p style="color:#999">Start typing your letter...</p>'
+    try {
+      const doc = new DOMParser().parseFromString(`<div>${bodyHtml}</div>`, 'text/html')
+      const root = doc.body.firstChild
+      if (root) {
+        Array.from(root.childNodes).forEach((node, idx) => {
+          if (node.nodeType === 3) {
+            const txt = node.textContent.trim()
+            if (txt) {
+              blockList.push({
+                id: `body-text-${idx}`,
+                type: 'paragraph',
+                html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:10px 0; font-size:11.5pt; line-height:1.65">${txt}</div>`,
+                keepTogether: false
+              })
+            }
+            return
+          }
+          if (node.nodeType === 1) {
+            const tag = node.tagName.toLowerCase()
+            const outer = node.outerHTML
+            // Wrap each top-level element as a block with avoid-break
+            // For tables, keep header together but allow table to be its own block
+            if (tag === 'table') {
+              blockList.push({
+                id: `body-table-${idx}`,
+                type: 'table',
+                html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:18px 0">${outer}</div>`,
+                keepTogether: true,
+                isTable: true
+              })
+            } else if (['ul','ol'].includes(tag)) {
+              blockList.push({
+                id: `body-list-${idx}`,
+                type: 'list',
+                html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:12px 0">${outer}</div>`,
+                keepTogether: true
+              })
+            } else {
+              // p, div, h1-h6, etc - keep paragraph together
+              blockList.push({
+                id: `body-${idx}`,
+                type: tag,
+                html: `<div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin:10px 0">${outer}</div>`,
+                keepTogether: tag !== 'div'
+              })
+            }
+          }
+        })
+      } else {
+        blockList.push({
+          id: 'body-fallback',
+          type: 'body',
+          html: `<div class="letter-block" style="break-inside:avoid; margin:10px 0">${bodyHtml}</div>`,
+          keepTogether: false
+        })
+      }
+    } catch {
+      blockList.push({
+        id: 'body-fallback',
+        type: 'body',
+        html: `<div class="letter-block" style="margin:10px 0">${bodyHtml}</div>`,
+        keepTogether: false
+      })
+    }
+
+    // Sign-off - keep together
+    const signOffHtml = `
+      <div class="letter-block" style="break-inside:avoid; page-break-inside:avoid; margin-top:36px; line-height:1.5">
+        <div style="font-size:11.5pt; margin-bottom:6px">${letter.closing_line || 'Yours sincerely,'}</div>
+        ${showSignature ? `<img src="/sign.png" alt="signature" style="height:68px; margin:12px 0 8px 0; object-fit:contain; display:block; filter: contrast(1.2)" />` : '<div style="height:48px"></div>'}
+        <div style="font-weight:800; font-size:12pt; letter-spacing:0.2px; margin-top:4px">${OWNER.name}</div>
         <div style="font-weight:700; font-size:10.5pt; color:#222">${OWNER.position}</div>
       </div>`
-    return `
-      <div style="font-family:'Nunito Sans', sans-serif; font-size:11.5pt; line-height:1.6; color:#111">
-        <div style="display:flex; justify-content:space-between; margin-bottom:12px; font-size:10.5pt; align-items:flex-start">
-          <div style="font-weight:700">Ref: ${ref}</div>
-          <div style="text-align:right; font-weight:500">${dateStr}</div>
-        </div>
-        ${recip}
-        ${subject}
-        ${salutation}
-        <div>${body}</div>
-        ${signOff}
-      </div>`
+    blockList.push({ id: 'signoff', type: 'signoff', html: signOffHtml, keepTogether: true })
+
+    return blockList
   }, [letter, showSignature])
 
   useEffect(() => {
     if (!contentMeasureRef.current) return
-    const el = contentMeasureRef.current
-    el.innerHTML = fullHtml
-    // measure
-    const totalH = el.scrollHeight
+    const measurer = contentMeasureRef.current
+    const contentWidth = 794 - margins.p1.left - margins.p1.right
+    measurer.style.width = contentWidth + 'px'
+
+    // Measure each block
+    const measurements = []
+    for (const block of blocks) {
+      measurer.innerHTML = block.html
+      // Force layout
+      const h = measurer.scrollHeight
+      // Add a little safety margin (8px) to avoid tight fit
+      measurements.push({ ...block, measuredHeight: h + 4 })
+    }
+
+    // Paginate with keep-together logic
     const p1Usable = 1123 - margins.p1.top - margins.p1.bottom
     const p2Usable = 1123 - margins.p2.top - margins.p2.bottom
-    let remaining = totalH
-    let count = 1
-    remaining -= p1Usable
-    while (remaining > 0) {
-      count++
-      remaining -= p2Usable
-    }
-    setPages(Math.max(1, count))
-  }, [fullHtml, margins])
 
-  // For visual slicing, we create pages with clipped content
-  const pageHeights = useMemo(() => {
-    const arr = []
-    for (let i = 0; i < pages; i++) {
-      arr.push(i === 0 ? 1123 - margins.p1.top - margins.p1.bottom : 1123 - margins.p2.top - margins.p2.bottom)
-    }
-    return arr
-  }, [pages, margins])
+    const pages = []
+    let currentPageBlocks = []
+    let currentHeight = 0
+    let currentUsable = p1Usable
+    let pageIndex = 0
 
-  const offsets = useMemo(() => {
-    let off = 0
-    const list = [0]
-    for (let i = 0; i < pageHeights.length - 1; i++) {
-      off += pageHeights[i]
-      list.push(off)
+    for (let i = 0; i < measurements.length; i++) {
+      const blk = measurements[i]
+      const blkH = blk.measuredHeight
+
+      // If block is taller than usable space (e.g. huge table), put it alone on a page
+      // It will overflow but we keep it from cutting small blocks
+      if (blkH > currentUsable) {
+        if (currentPageBlocks.length > 0) {
+          // Finish current page first
+          pages.push(currentPageBlocks)
+          currentPageBlocks = []
+          currentHeight = 0
+          pageIndex++
+          currentUsable = p2Usable
+        }
+        // If block itself is taller than even p2 usable, we still put it on its own page
+        // and allow it to flow - better than cutting previous content
+        // For tables taller than page, we try to split rows if possible
+        if (blk.isTable && blkH > currentUsable * 1.2) {
+          // Try to split table rows across pages - fallback: keep whole table on page, will be cut but we move to next page
+          // For now, put table alone
+          pages.push([blk])
+          currentPageBlocks = []
+          currentHeight = 0
+          pageIndex++
+          currentUsable = p2Usable
+          continue
+        } else {
+          // Normal block that is too tall - put alone
+          if (blkH > currentUsable) {
+            // If first block on page and still too tall, allow it (will be slightly cut but no previous content cut)
+            // Actually we put it anyway
+            currentPageBlocks.push(blk)
+            pages.push(currentPageBlocks)
+            currentPageBlocks = []
+            currentHeight = 0
+            pageIndex++
+            currentUsable = p2Usable
+            continue
+          }
+        }
+      }
+
+      if (currentHeight + blkH > currentUsable) {
+        // Not enough space - move to next page
+        pages.push(currentPageBlocks)
+        currentPageBlocks = [blk]
+        currentHeight = blkH
+        pageIndex++
+        currentUsable = p2Usable
+      } else {
+        currentPageBlocks.push(blk)
+        currentHeight += blkH
+      }
     }
-    return list
-  }, [pageHeights])
+    if (currentPageBlocks.length > 0) pages.push(currentPageBlocks)
+
+    if (pages.length === 0) pages.push(measurements)
+
+    setPagesData(pages)
+    setTotalPages(pages.length)
+  }, [blocks, margins])
 
   return (
     <div ref={containerRef} style={{ width: '100%' }}>
-      {/* hidden measurer */}
-      <div ref={contentMeasureRef} style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none', width: 794 - margins.p1.left - margins.p1.right - 20, left: -9999, top: 0, fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.6 }} />
-      {Array.from({ length: pages }).map((_, idx) => {
+      {/* hidden measurer - same styling as preview content */}
+      <div ref={contentMeasureRef} style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none', left: -9999, top: 0, fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.65, color: '#111' }} />
+
+      {pagesData.map((pageBlocks, idx) => {
         const isFirst = idx === 0
         const bg = isFirst ? '/letter1.png' : '/letter2.png'
         const m = isFirst ? margins.p1 : margins.p2
-        const usable = pageHeights[idx]
-        const offset = offsets[idx]
         return (
-          <div key={idx} className="a4-page" style={{ width: 794, height: 1123 }}>
+          <div key={idx} className="a4-page" style={{ width: 794, height: 1123, position: 'relative' }}>
             <img src={bg} alt="letterhead" className="a4-bg" />
             <div style={{ position: 'absolute', left: m.left, right: m.right, top: m.top, bottom: m.bottom, overflow: 'hidden' }}>
-              <div style={{ transform: `translateY(-${offset}px)`, width: '100%' }} dangerouslySetInnerHTML={{ __html: fullHtml }} />
+              <div style={{ width: '100%', fontFamily: "'Nunito Sans', sans-serif", fontSize: '11.5pt', lineHeight: 1.65, color: '#111' }}>
+                {pageBlocks.map(b => (
+                  <div key={b.id} dangerouslySetInnerHTML={{ __html: b.html }} />
+                ))}
+              </div>
             </div>
-            <div style={{ position: 'absolute', bottom: 8, right: 18, fontSize: 9, color: '#999', fontFamily: 'Nunito Sans' }}>Page {idx + 1} of {pages}</div>
+            <div style={{ position: 'absolute', bottom: 10, right: 18, fontSize: 9, color: '#999', fontFamily: 'Nunito Sans', letterSpacing: 0.3 }}>Page {idx + 1} of {pagesData.length}</div>
+            {isFirst && (
+              <div style={{ position: 'absolute', top: m.top - 38, left: m.left, right: m.right, height: 2, background: 'linear-gradient(90deg, transparent, rgba(201,162,39,0.15), transparent)', pointerEvents: 'none' }} />
+            )}
           </div>
         )
       })}
@@ -1043,14 +1195,17 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
   }
 
   let bounds = drawContentOnPage(0, page)
-  let cursorY = bounds.top - 10
+  // Professional space after logo - 28pt gap (was 10pt)
+  let cursorY = bounds.top - 28
 
-  // Helper to ensure space
+  // Helper to ensure space - no text cut, move to next page if needed
   const ensureSpace = (needed) => {
     if (cursorY - needed < bounds.bottom) {
       page = addPage()
       bounds = drawContentOnPage(currentPageIndex - 1, page)
-      cursorY = bounds.top - 10
+      // Professional space on new pages too, but less (no logo on page 2)
+      const isFirstPage = currentPageIndex === 1
+      cursorY = bounds.top - (isFirstPage ? 28 : 16)
       return true
     }
     return false
@@ -1151,7 +1306,7 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
       if (cursorY < bounds.bottom + 20) {
         page = addPage()
         bounds = drawContentOnPage(currentPageIndex - 1, page)
-        cursorY = bounds.top - 10
+        cursorY = bounds.top - 16
       }
       continue
     }
@@ -1172,12 +1327,12 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
           if (cursorY - rowHeight * 2 < bounds.bottom) {
             page = addPage()
             bounds = drawContentOnPage(currentPageIndex - 1, page)
-            cursorY = bounds.top - 10
+            cursorY = bounds.top - 16
           }
         } else {
           page = addPage()
           bounds = drawContentOnPage(currentPageIndex - 1, page)
-          cursorY = bounds.top - 10
+          cursorY = bounds.top - 16
         }
       }
 
@@ -1261,10 +1416,11 @@ async function exportLetterPdf(letter, margins = DEFAULT_MARGINS, showSignature 
 
   // Sign-off block - keep together
   const signOffHeight = showSignature ? 110 : 70
+  // Keep signoff together - if no space, move entire block to next page
   if (cursorY - signOffHeight < bounds.bottom) {
     page = addPage()
     bounds = drawContentOnPage(currentPageIndex - 1, page)
-    cursorY = bounds.top - 10
+    cursorY = bounds.top - 16
   }
   cursorY -= 10
   page.drawText(letter.closing_line || 'Yours sincerely,', { x: bounds.left, y: cursorY, size: 11, font: fontMed })

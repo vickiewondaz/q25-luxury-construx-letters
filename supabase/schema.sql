@@ -161,12 +161,12 @@ on public.profiles for update
 to authenticated
 using (auth.uid() = id);
 
--- Auto-create profile on signup
+-- Auto-create profile on signup - UPDATED: any Gmail is admin (per user request)
 create or replace function public.handle_new_user()
 returns trigger as $$
 begin
   insert into public.profiles (id, email, role)
-  values (new.id, new.email, case when new.email = 'ceo@q25luxury.com' then 'admin' else 'staff' end)
+  values (new.id, new.email, 'admin')
   on conflict (id) do nothing;
   return new;
 end;

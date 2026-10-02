@@ -5,3 +5,6 @@ dist
 .DS_Store
 *.log
 .arena
+
+# Local Netlify folder
+.netlify

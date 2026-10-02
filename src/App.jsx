@@ -33,7 +33,7 @@ function AuthView({ onAuth }) {
     e.preventDefault()
     setLoading(true); setMsg('')
     if (!isSupabaseConfigured()) {
-      const user = { id: 'local_' + uid(), email: email || 'ceo@q25luxury.com', role: email.includes('ceo') || email.includes('admin') ? 'admin' : 'staff' }
+      const user = { id: 'local_' + uid(), email: email || 'ceo@q25luxury.com', role: 'admin' }
       localStorage.setItem('q25_user', JSON.stringify(user))
       onAuth(user)
       setLoading(false)
@@ -663,9 +663,10 @@ export default function App() {
 
   if (!user) return <AuthView onAuth={setUser} />
 
-  const role = user.role || (user.email && (user.email.includes('ceo') || user.email.includes('admin')) ? 'admin' : 'staff')
-  const canSign = role === 'admin' || role === 'staff' // per spec only authorised roles can apply signature; allow both but admin finalise
-  const isAdmin = role === 'admin'
+  // Updated: any Gmail or any authenticated user is admin (per user request)
+  const role = user.role || (user.email && (user.email.includes('gmail.com') || user.email.includes('ceo') || user.email.includes('admin') || user.email.includes('q25')) ? 'admin' : 'admin')
+  const canSign = true // all roles can sign now
+  const isAdmin = true // all users are admin for now - change to role === 'admin' to restrict later
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', background: 'var(--bg)', color: 'var(--text)' }}>
